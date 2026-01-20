@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+.env
+.venv/
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Logs and Diagnostics
+logs/
+errors/
+*.log
+
+# Project specific output directories
+processed/
+imbox/
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Release folders (assuming these are artifacts)
+Release-*/
