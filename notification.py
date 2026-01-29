@@ -1,39 +1,38 @@
 import win32com.client as win32
 from datetime import datetime
 import os
+from outcomes import SKIPPED_NO_RECIPIENT
+from utils_masking import mask_cpf_in_text
 
-def enviar_resumo_email(destinatario, relatorio):
+
+def enviar_resumo_email(destinatario, relatorio, execution_id, run_status, report_paths=None, manifest_path=None, logger=None):
     """
-    Envia um email de resumo com o relatório HTML.
-    destinatario: str (email)
-    relatorio: dict (contendo chaves: total, sucessos, erros, tempo_total)
+    Envia email de resumo com anexos.
+    Retorna (status, error_message)
     """
     if not destinatario:
-        print("⚠ Destinatário de email não configurado. Pulo envio.")
-        return
+        msg = "DestinatÃ¡rio de email nÃ£o configurado. Pulo envio."
+        if logger:
+            logger.warning(msg, step="email")
+        else:
+            print(f"âš  {msg}")
+        return (SKIPPED_NO_RECIPIENT, msg)
 
     try:
         outlook = win32.Dispatch('outlook.application')
         mail = outlook.CreateItem(0)
         mail.To = destinatario
-        mail.Subject = f"Resumo Processamento ASO RPA - {datetime.now().strftime('%d/%m/%Y')}"
-        
-        # Formatar listas para HTML
+        date_str = datetime.now().strftime('%Y-%m-%d')
+        mail.Subject = f"[ASO] {run_status} | {date_str} | exec={execution_id}"
+
         erros_html = ""
         if relatorio.get('erros'):
             for erro in relatorio['erros']:
-                erros_html += f"<tr><td>{erro.get('arquivo')}</td><td style='color:red'>{erro.get('erro')}</td></tr>"
+                arquivo = mask_cpf_in_text(str(erro.get('arquivo')))
+                msg = mask_cpf_in_text(str(erro.get('erro')))
+                erros_html += f"<tr><td>{arquivo}</td><td style='color:red'>{msg}</td></tr>"
         else:
             erros_html = "<tr><td colspan='2'>Nenhum erro registrado.</td></tr>"
-
-        sucessos_html = ""
-        if relatorio.get('sucessos'):
-            for suc in relatorio['sucessos'][:50]: # Limitar visualização
-                sucessos_html += f"<li>{suc}</li>"
-            if len(relatorio['sucessos']) > 50:
-                sucessos_html += f"<li>... e mais {len(relatorio['sucessos']) - 50} arquivos.</li>"
-        else:
-            sucessos_html = "<li>Nenhum arquivo processado com sucesso.</li>"
 
         html_body = f"""
         <html>
@@ -48,34 +47,53 @@ def enviar_resumo_email(destinatario, relatorio):
             </style>
         </head>
         <body>
-            <h2>Resumo da Execução RPA ASO</h2>
-            
+            <h2>Resumo da ExecuÃ§Ã£o RPA ASO</h2>
+            <p><strong>Execution ID:</strong> {execution_id}</p>
+            <p><strong>Status:</strong> {run_status}</p>
+
             <div class="summary">
                 <p><strong>Data:</strong> {datetime.now().strftime('%d/%m/%Y %H:%M')}</p>
                 <p><strong>Tempo Total:</strong> {relatorio.get('tempo_total', 'N/A')}</p>
-                <p><strong>Total Detectado:</strong> {relatorio.get('total', 0)}</p>
-                <p><strong>Sucessos:</strong> <span style="color:green; font-weight:bold">{len(relatorio.get('sucessos', []))}</span></p>
-                <p><strong>Erros:</strong> <span style="color:red; font-weight:bold">{len(relatorio.get('erros', []))}</span></p>
+                <p><strong>Total Detectado:</strong> {relatorio.get('total_detected', 0)}</p>
+                <p><strong>Total Processado:</strong> {relatorio.get('total_processed', 0)}</p>
+                <p><strong>Sucessos:</strong> <span style="color:green; font-weight:bold">{relatorio.get('success', 0)}</span></p>
+                <p><strong>Erros:</strong> <span style="color:red; font-weight:bold">{relatorio.get('error', 0)}</span></p>
             </div>
 
-            <h3>Erros ({len(relatorio.get('erros', []))})</h3>
+            <h3>Erros ({relatorio.get('error', 0)})</h3>
             <table>
                 <tr><th>Arquivo</th><th>Erro</th></tr>
                 {erros_html}
             </table>
-            
-            <h3>Sucessos Recentes</h3>
+
+            <h3>EvidÃªncias</h3>
             <ul>
-                {sucessos_html}
+                <li>Report JSON: {report_paths.get('json') if report_paths else 'N/A'}</li>
+                <li>Resumo MD: {report_paths.get('md') if report_paths else 'N/A'}</li>
+                <li>Manifest: {manifest_path or 'N/A'}</li>
             </ul>
         </body>
         </html>
         """
-        
+
         mail.HTMLBody = html_body
+
+        for path in (report_paths or {}).values():
+            if path and os.path.exists(path):
+                mail.Attachments.Add(Source=path)
+
+        if manifest_path and os.path.exists(manifest_path):
+            mail.Attachments.Add(Source=manifest_path)
+
         mail.Send()
-        print(f"📧 Email enviado para {destinatario}")
-        return True
+        if logger:
+            logger.info(f"Email enviado para {destinatario}", step="email")
+        else:
+            print(f"ðŸ“§ Email enviado para {destinatario}")
+        return ("SENT", None)
     except Exception as e:
-        print(f"❌ Erro ao enviar email: {e}")
-        return False
+        if logger:
+            logger.error(f"Erro ao enviar email: {e}", step="email")
+        else:
+            print(f"âŒ Erro ao enviar email: {e}")
+        return ("FAILED", str(e))

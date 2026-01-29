@@ -2,6 +2,8 @@ import win32com.client as win32
 import os
 import re
 import shutil
+import uuid
+import json
 from dotenv import load_dotenv
 
 # Carrega variáveis de ambiente do arquivo .env (se existir)
@@ -17,6 +19,15 @@ from rpa_yube import run_from_main
 from custom_logger import RpaLogger
 from reporting import ReportGenerator
 from notification import enviar_resumo_email
+from outcomes import (
+    SUCCESS,
+    ERROR,
+    SKIPPED_DUPLICATE,
+    SKIPPED_DRAFT,
+    SKIPPED_NON_ASO,
+)
+from utils_masking import mask_cpf, mask_cpf_in_text
+from idempotency import should_skip_duplicate
 
 # ----------------------------
 # CONFIGURAÇÕES
@@ -65,7 +76,7 @@ else:
 # Poppler também pode vir do .env
 POPPLER_PATH = os.getenv("POPPLER_PATH", r"P:\ASO\Release-24.08.0-0\poppler-24.08.0\Library\bin")
 
-PASTA_BASE = r"P:\ProcessoASO"
+PASTA_BASE = os.getenv("PROCESSO_ASO_BASE", r"P:\ProcessoASO")
 PASTA_PROCESSADOS = os.path.join(PASTA_BASE, "processados")
 PASTA_EM_PROCESSAMENTO = os.path.join(PASTA_BASE, "em processamento")
 PASTA_ERROS = os.path.join(PASTA_BASE, "erros")
@@ -90,9 +101,9 @@ TARGET_ACCOUNT = os.getenv("ASO_EMAIL_ACCOUNT", "aso@enesa.com.br")
 # ====================================================================
 # FUNÇÃO DE LOG (Wrapper para o logger estruturado)
 # ====================================================================
-def registrar_log(msg):
+def registrar_log(msg, context=None):
     # Mantém compatibilidade com chamadas existentes
-    logger.info(msg)
+    logger.info(msg, extra=context)
 
 
 # ====================================================================
@@ -125,19 +136,23 @@ def eh_aso(texto_ocr):
 # ====================================================================
 # FUNÇÃO - EXTRAI DADOS COMPLETOS (OCR)
 # ====================================================================
-def extrair_dados_completos(img):
+def extrair_dados_completos(img, texto_ocr=None):
     """
-    Retorna: nome, cpf, data_aso, funcao_cargo
+    Retorna: nome, cpf, data_aso, funcao_cargo, texto_ocr
     """
-    try:
-        texto = pytesseract.image_to_string(img, lang="por+eng")
-        # Checagem de Rascunho
-        if "Rascunho" in texto and texto.upper().count("RASCUNHO") > 3:
-             print("ℹ️  Arquivo identificado como RASCUNHO. Ignorando.")
-             return "RASCUNHO", "Ignorar", "", ""
-    except Exception as e:
-        texto = ""
-        registrar_log(f"Erro no pytesseract: {e}")
+    if texto_ocr is None:
+        try:
+            texto_ocr = pytesseract.image_to_string(img, lang="por+eng")
+        except Exception as e:
+            texto_ocr = ""
+            registrar_log(f"Erro no pytesseract: {e}")
+
+    texto = texto_ocr or ""
+
+    # Checagem de Rascunho
+    if "RASCUNHO" in texto.upper() and texto.upper().count("RASCUNHO") > 3:
+         print("INFO: Arquivo identificado como RASCUNHO. Ignorando.")
+         return "RASCUNHO", "Ignorar", "", "", texto_ocr
 
     # Normalizar um pouco o texto para buscas
     texto_compacto = re.sub(r"\s+", " ", texto)
@@ -200,7 +215,7 @@ def extrair_dados_completos(img):
             
     # Debug para casos falhos
     if nome == "Desconhecido":
-        registrar_log(f"DEBUG OCR FALHO (CPF={cpf}): Texto parcial: {texto[:200].replace(chr(10), ' ')}")
+        registrar_log(f"DEBUG OCR FALHO (CPF={mask_cpf(cpf)}): Texto parcial: {texto[:200].replace(chr(10), ' ')}")
         # Fallback: nome imediatamente antes do CPF
         bloco = re.search(
             r"([A-ZÀ-Ý][A-ZÀ-Ý \-]{5,150})\s+(?:CPF|C\.P\.F)",
@@ -281,10 +296,10 @@ def extrair_dados_completos(img):
     # --- DIAGNÓSTICO PARA O USUÁRIO ---
     if cpf == "CPF_Desconhecido":
         print(f"⚠️  ALERTA DE LEITURA: Não foi possível ler o CPF neste arquivo.")
-        registrar_log(f"DEBUG OCR: Falha CPF. Texto parcial: {texto[:100]}")
+        registrar_log(f"DEBUG OCR: Falha CPF", context={"partial_text": texto[:100], "status": "CPF_MISSING"})
     elif nome == "Desconhecido":
-        print(f"⚠️  ALERTA DE LEITURA: CPF encontrato ({cpf}), mas NOME não identificado.")
-        registrar_log(f"DEBUG OCR: Falha Nome (CPF={cpf}). Texto parcial: {texto[:100]}")
+        print(f"⚠️  ALERTA DE LEITURA: CPF encontrato ({mask_cpf(cpf)}), mas NOME não identificado.")
+        registrar_log(f"DEBUG OCR: Falha Nome", context={"cpf": cpf, "partial_text": texto[:100], "status": "NAME_MISSING"})
     else:
         # Sucesso parcial (debug)
         pass # print(f"   (Leitura OK: {nome} | {cpf})")
@@ -310,8 +325,10 @@ def extrair_dados_completos(img):
     funcao_cargo = "Desconhecida"
 
     # 1) Função com OCR bugado: Fungao, Funcéo, Funç5o, etc.
+    # 1) Função com OCR bugado: Fungao, Funcéo, Funç5o, etc.
+    # Stop capturing if we hit another label like Setor, Cargo, GHE, Riscos, CPF, Data
     padrao_funcao = re.search(
-        r"Fun[cç5g][aãaõo0eéê]{1,3}o[:/\s\-]*([A-ZÀ-Ý0-9][A-ZÀ-Ý0-9 \-\._]{3,150})",
+        r"Fun[cç5g][aãaõo0eéê]{1,3}o[:/\s\-]*([A-ZÀ-Ý0-9][A-ZÀ-Ý0-9 \-\._]{3,150}?)(?=\s+(?:Setor|Cargo|GHE|Riscos|CPF|Data)|$)",
         texto_compacto,
         re.IGNORECASE
     )
@@ -369,34 +386,77 @@ def extrair_dados_completos(img):
     if not funcao_cargo:
         funcao_cargo = "Desconhecida"
 
-    return nome, cpf, data_aso, funcao_cargo
+    return nome, cpf, data_aso, funcao_cargo, texto_ocr
 
 # ====================================================================
 # SALVA PDFs SEPARADOS E GERA O TXT POR ANEXO
 # ====================================================================
-def salvar_paginas_individualmente(pdf_path, pasta_destino, numero_obra, lista_novos_arquivos=None):
+def salvar_paginas_individualmente(pdf_path, pasta_destino, numero_obra, lista_novos_arquivos=None, stats=None, manifest_items=None):
     try:
         imagens = convert_from_path(pdf_path, dpi=300, poppler_path=POPPLER_PATH)
     except Exception as e:
         registrar_log(f"Erro ao converter PDF '{pdf_path}': {e}")
+        if stats is not None:
+            stats["error"] += 1
+            stats["erros"].append({"arquivo": os.path.basename(pdf_path), "erro": f"Erro conversao PDF: {e}"})
         return
 
-    # >>>>> NOVO: TXT exclusivo para cada anexo
     nome_txt = f"OCR_{os.path.basename(pdf_path).replace('.pdf', '')}.txt"
     txt_path = os.path.join(pasta_destino, nome_txt)
 
     for i, img in enumerate(imagens, start=1):
         try:
-            nome, cpf, dataaso, funcao_cargo = extrair_dados_completos(img)
-
-            # OCR bruto da página para identificar ASO
             try:
                 texto_ocr = pytesseract.image_to_string(img, lang="por+eng")
-            except:
+            except Exception as e:
                 texto_ocr = ""
+                registrar_log(f"Erro no pytesseract: {e}")
 
+            nome, cpf, dataaso, funcao_cargo, texto_ocr = extrair_dados_completos(img, texto_ocr=texto_ocr)
             is_aso = eh_aso(texto_ocr)
 
+            if stats is not None:
+                stats["total_detected"] += 1
+
+            outcome = None
+            outcome_msg = None
+            if nome == "RASCUNHO" or cpf == "Ignorar":
+                outcome = SKIPPED_DRAFT
+                outcome_msg = "Rascunho detectado"
+                if stats is not None:
+                    stats["skipped_draft"] += 1
+                    stats["skipped_items"].append(f"{outcome}: {mask_cpf_in_text(os.path.basename(pdf_path))}#pg{i}")
+            elif not is_aso:
+                outcome = SKIPPED_NON_ASO
+                outcome_msg = "Nao identificado como ASO"
+                if stats is not None:
+                    stats["skipped_non_aso"] += 1
+                    stats["skipped_items"].append(f"{outcome}: {mask_cpf_in_text(os.path.basename(pdf_path))}#pg{i}")
+
+            if outcome:
+                if manifest_items is not None:
+                    manifest_items.append({
+                        "file_display": mask_cpf_in_text(os.path.basename(pdf_path)),
+                        "page": i,
+                        "cpf_masked": mask_cpf(cpf),
+                        "outcome": outcome,
+                        "message": outcome_msg,
+                    })
+
+                try:
+                    with open(txt_path, "a", encoding="utf-8") as txt:
+                        txt.write("\n======================================\n")
+                        txt.write(f"Obra: {numero_obra}\n")
+                        txt.write(f"Outcome: {outcome}\n")
+                        txt.write(f"Arquivo origem: {os.path.basename(pdf_path)}\n")
+                        txt.write(f"Nome: {nome}\n")
+                        txt.write(f"CPF: {mask_cpf(cpf)}\n")
+                        txt.write(f"Data ASO: {dataaso}\n")
+                        txt.write(f"Funcao/Cargo: {funcao_cargo}\n")
+                        txt.write("======================================\n")
+                except Exception as e:
+                    registrar_log(f"Erro ao escrever TXT: {e}")
+                continue
 
             nome_limpo = re.sub(r"[^\w\s\-]", "", nome).strip()
             if not nome_limpo:
@@ -404,45 +464,51 @@ def salvar_paginas_individualmente(pdf_path, pasta_destino, numero_obra, lista_n
 
             nome_final = f"{nome_limpo} - {cpf}.pdf"
             caminho_final = os.path.join(pasta_destino, nome_final)
-            
-            arquivo_salvo = False
 
-            if not os.path.exists(caminho_final):
-                img.save(caminho_final, "PDF", resolution=300.0)
-                registrar_log(f"Arquivo salvo: {caminho_final}")
-                arquivo_salvo = True
-            else:
-                # Alteração solicitada: NÃO sobrescrever se já existe.
-                # Mas marcamos como True para garantir que o RPA verifique se este arquivo (já existente) foi processado.
-                registrar_log(f"Arquivo já existe na pasta (não sobrescrito): {caminho_final}")
-                arquivo_salvo = True
-            
-            if arquivo_salvo and lista_novos_arquivos is not None:
+            if should_skip_duplicate(caminho_final):
+                registrar_log(f"Arquivo ja existe na pasta (nao sobrescrito): {caminho_final}")
+                if stats is not None:
+                    stats["skipped_duplicate"] += 1
+                    stats["skipped_items"].append(f"{SKIPPED_DUPLICATE}: {mask_cpf_in_text(nome_final)}")
+                if manifest_items is not None:
+                    manifest_items.append({
+                        "file_display": mask_cpf_in_text(nome_final),
+                        "cpf_masked": mask_cpf(cpf),
+                        "outcome": SKIPPED_DUPLICATE,
+                        "message": "Arquivo ja existente",
+                    })
+                continue
+
+            img.save(caminho_final, "PDF", resolution=300.0)
+            registrar_log(f"Arquivo salvo: {caminho_final}")
+
+            if lista_novos_arquivos is not None:
                 lista_novos_arquivos.append(caminho_final)
 
-
-            # >>>>> ESCREVE NO TXT DO ANEXO
             try:
                 with open(txt_path, "a", encoding="utf-8") as txt:
                     txt.write("\n======================================\n")
                     txt.write(f"Obra: {numero_obra}\n")
                     txt.write(f"Arquivo gerado: {nome_final}\n")
                     txt.write(f"Nome: {nome}\n")
-                    txt.write(f"CPF: {cpf}\n")
+                    txt.write(f"CPF: {mask_cpf(cpf)}\n")
                     txt.write(f"Data ASO: {dataaso}\n")
-                    txt.write(f"Função/Cargo: {funcao_cargo}\n")
+                    txt.write(f"Funcao/Cargo: {funcao_cargo}\n")
                     txt.write("======================================\n")
             except Exception as e:
                 registrar_log(f"Erro ao escrever TXT: {e}")
 
         except Exception as e:
-            registrar_log(f"Erro na página {i} do PDF '{pdf_path}': {e}")
+            registrar_log(f"Erro na pagina {i} do PDF '{pdf_path}': {e}")
+            if stats is not None:
+                stats["error"] += 1
+                stats["erros"].append({"arquivo": os.path.basename(pdf_path), "erro": f"Erro pagina {i}: {e}"})
 
 
 # ====================================================================
 # CAPTA EMAIL E PROCESSA ANEXOS
 # ====================================================================
-def captar_emails(limit=200):
+def captar_emails(limit=200, execution_id=None, started_at=None, manifest=None):
     registrar_log("Iniciando leitura do Outlook...")
     anexos_processados = set()
 
@@ -532,14 +598,22 @@ def captar_emails(limit=200):
         if days_back_env:
             registrar_log(f"  (Configurado via ASO_DAYS_BACK={days_back_env})")
     
-    # ESTATÍSTICAS GERAIS ACUMULADAS
+    # ESTATISTICAS GERAIS ACUMULADAS
     stats_gerais = {
-        'total': 0,
+        'execution_id': execution_id,
+        'started_at': started_at.isoformat() if started_at else None,
+        'total_detected': 0,
+        'total_processed': 0,
+        'success': 0,
+        'error': 0,
+        'skipped_duplicate': 0,
+        'skipped_draft': 0,
+        'skipped_non_aso': 0,
         'sucessos': [],
         'erros': [],
-        'tempo_total': '' # será calculado no final aproximado
+        'skipped_items': [],
+        'tempo_total': ''
     }
-    
     start_time_total = datetime.now()
 
     # Collect indices to iterate in reverse, to avoid issues with deleting items if that were ever implemented
@@ -614,7 +688,7 @@ def captar_emails(limit=200):
                     anexos_processados.add(hash_atual)
 
                     # Passamos a lista para coletar os novos arquivos
-                    salvar_paginas_individualmente(temp_pdf, pasta_data, numero_obra, lista_novos_arquivos=arquivos_para_rpa)
+                    salvar_paginas_individualmente(temp_pdf, pasta_data, numero_obra, lista_novos_arquivos=arquivos_para_rpa, stats=stats_gerais, manifest_items=(manifest.get("items") if manifest else None))
 
                     os.remove(temp_pdf)
 
@@ -634,13 +708,31 @@ def captar_emails(limit=200):
                     
                     if stats_rpa:
                         # ACUMULA RESULTADOS
-                        stats_gerais['total'] += stats_rpa.get('total', 0)
-                        stats_gerais['sucessos'].extend(stats_rpa.get('sucessos', []))
-                        stats_gerais['erros'].extend(stats_rpa.get('erros', []))
+                        stats_gerais['sucessos'].extend([mask_cpf_in_text(s) for s in stats_rpa.get('sucessos', [])])
+                        stats_gerais['erros'].extend([{"arquivo": mask_cpf_in_text(e.get('arquivo', 'Desconhecido')), "erro": e.get('erro', '')} for e in stats_rpa.get('erros', [])])
+                        stats_gerais['success'] += len(stats_rpa.get('sucessos', []))
+                        stats_gerais['error'] += len(stats_rpa.get('erros', []))
+                        stats_gerais['total_processed'] = stats_gerais['success'] + stats_gerais['error']
+                        if manifest and manifest.get('items') is not None:
+                            for fname in stats_rpa.get('sucessos', []):
+                                manifest['items'].append({
+                                    'file_display': mask_cpf_in_text(fname),
+                                    'cpf_masked': mask_cpf(fname),
+                                    'outcome': SUCCESS,
+                                    'message': 'RPA sucesso'
+                                })
+                            for err in stats_rpa.get('erros', []):
+                                manifest['items'].append({
+                                    'file_display': mask_cpf_in_text(err.get('arquivo', 'Desconhecido')),
+                                    'cpf_masked': mask_cpf(err.get('arquivo', '')),
+                                    'outcome': ERROR,
+                                    'message': err.get('erro', '')
+                                })
 
                 except Exception as e:
                     registrar_log(f"Erro ao executar RPA Yube: {e}")
                     stats_gerais['erros'].append({'arquivo': 'RPA_CRASH', 'erro': str(e)})
+                    stats_gerais['error'] += 1
             else:
                 registrar_log("Nenhum arquivo novo para processar no RPA.")
 
@@ -662,22 +754,62 @@ def captar_emails(limit=200):
     # ENVIO DO RESUMO CONSOLIDADO
     # ==================================================
     elapsed_total = datetime.now() - start_time_total
+    run_status = "INCONSISTENT" if stats_gerais['error'] > 0 else "CONSISTENT"
     stats_gerais['tempo_total'] = str(timedelta(seconds=int(elapsed_total.total_seconds())))
 
-    # Só envia email se houver algo processado (sucesso ou erro)
-    if stats_gerais['total'] > 0 or stats_gerais['erros']:
-        registrar_log("Gerando relatório e enviando email...")
+    stats_gerais['total_processed'] = stats_gerais['success'] + stats_gerais['error']
+    stats_gerais['total'] = stats_gerais['total_processed']
+    stats_gerais['run_status'] = run_status
+    if manifest is not None:
+        manifest['finished_at'] = datetime.now().isoformat()
+        manifest['duration_sec'] = int(elapsed_total.total_seconds())
+        manifest['run_status'] = run_status
+        manifest['totals'] = {
+            'total_detected': stats_gerais['total_detected'],
+            'total_processed': stats_gerais['total_processed'],
+            'success': stats_gerais['success'],
+            'error': stats_gerais['error'],
+            'skipped_duplicate': stats_gerais['skipped_duplicate'],
+            'skipped_draft': stats_gerais['skipped_draft'],
+            'skipped_non_aso': stats_gerais['skipped_non_aso'],
+        }
+
+    manifest_path = None
+    if manifest is not None:
+        manifest_path = salvar_manifest(manifest, PASTA_RELATORIOS, execution_id=execution_id)
+        if manifest_path:
+            manifest['paths']['manifest'] = manifest_path
+
+    # So envia email se houver algo processado (sucesso ou erro)
+    if stats_gerais['total_detected'] > 0 or stats_gerais['error'] > 0:
+        registrar_log("Gerando relatorio e enviando email...")
         
-        # 1. Salvar Relatório JSON
-        reporter.save_report(stats_gerais)
+        # 1. Salvar Relatorio JSON/MD
+        report_paths = reporter.save_report(stats_gerais)
+        if manifest is not None:
+            manifest['paths'].update({
+                'report_json': report_paths.get('json') if report_paths else None,
+                'report_md': report_paths.get('md') if report_paths else None,
+                'logs': PASTA_LOGS,
+            })
         
         # 2. Enviar Email
-        try:
-           enviar_resumo_email(TARGET_ACCOUNT, stats_gerais)
-        except Exception as e:
-           registrar_log(f"Erro ao enviar email final: {e}")
+        email_status, email_error = enviar_resumo_email(
+            TARGET_ACCOUNT,
+            stats_gerais,
+            execution_id,
+            run_status,
+            report_paths=report_paths,
+            manifest_path=manifest_path,
+            logger=logger,
+        )
+        if manifest is not None:
+            manifest['email_status'] = email_status
+            manifest['email_error'] = email_error
+            if manifest_path:
+                salvar_manifest(manifest, PASTA_RELATORIOS, filepath=manifest_path, execution_id=execution_id)
     else:
-        registrar_log("Nada processado, email de resumo não enviado.")
+        registrar_log("Nada processado, email de resumo nao enviado.")
 
     registrar_log(f"Mensagens verificadas hoje: {encontrados_hoje}; mensagens processadas: {processados}")
 
@@ -687,9 +819,24 @@ def captar_emails(limit=200):
 # MAIN
 # ====================================================================
 if __name__ == "__main__":
-    registrar_log("===== INÍCIO DO PROCESSAMENTO DIÁRIO DE ASO =====")
+    execution_id = str(uuid.uuid4())
+    started_at = datetime.now()
+    logger.set_execution_id(execution_id)
+    manifest = {
+        'execution_id': execution_id,
+        'started_at': started_at.isoformat(),
+        'finished_at': None,
+        'duration_sec': None,
+        'run_status': None,
+        'paths': {},
+        'email_status': None,
+        'email_error': None,
+        'totals': {},
+        'items': []
+    }
+    registrar_log("===== INICIO DO PROCESSAMENTO DIARIO DE ASO =====", context={"execution_id": execution_id})
     try:
-        captar_emails(limit=500)
+        captar_emails(limit=500, execution_id=execution_id, started_at=started_at, manifest=manifest)
     except Exception as e:
         registrar_log(f"Erro fatal: {e}")
         try:
@@ -697,4 +844,4 @@ if __name__ == "__main__":
                 f.write(traceback.format_exc())
         except:
             pass
-    registrar_log("===== FIM DO PROCESSAMENTO =====")
+    registrar_log("===== FIM DO PROCESSAMENTO =====", context={"execution_id": execution_id})

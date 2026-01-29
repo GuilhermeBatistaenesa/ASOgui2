@@ -8,13 +8,14 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+from utils_masking import mask_cpf, mask_cpf_in_text
 
 load_dotenv()  # opcional: carregar YUBE_USER/YUBE_PASS se quiser
 
 # ---------- CONFIGURAÇÃO ----------
 YUBE_URL = os.getenv("YUBE_URL", "https://yube.com.br/")
-YUBE_USER = os.getenv("YUBE_USER", "priscilla.silva@enesa.com.br")
-YUBE_PASS = os.getenv("YUBE_PASS", "Enesa@2024")
+YUBE_USER = os.getenv("YUBE_USER")
+YUBE_PASS = os.getenv("YUBE_PASS")
 NAV_TIMEOUT = int(os.getenv("YUBE_NAV_TIMEOUT", "10000"))
 KEEP_BROWSER_OPEN = os.getenv("KEEP_BROWSER_OPEN", "1") == "1"
 UPLOAD_WAIT_MS = int(os.getenv("UPLOAD_WAIT_MS", "4000"))
@@ -38,10 +39,20 @@ logging.basicConfig(
     handlers=[
         logging.FileHandler(os.path.join(PASTA_LOGS_RPA, "rpa_yube_debug.log"), encoding='utf-8'),
         logging.StreamHandler()
-    ]
+    ],
+    level=logging.INFO
 )
 
+if not YUBE_USER or not YUBE_PASS:
+    logging.error("Credenciais YUBE nÃ£o configuradas. Defina YUBE_USER e YUBE_PASS no ambiente.")
+    raise RuntimeError("Credenciais YUBE nÃ£o configuradas. Defina YUBE_USER e YUBE_PASS no ambiente.")
+
 LOG_CSV = os.path.join(PASTA_LOGS_RPA, "rpa_log.csv")
+
+def _cpf_masked(cpf: str | None) -> str:
+    if not cpf:
+        return "CPF_DESCONHECIDO"
+    return mask_cpf(cpf, keep_last=3, mask_char="X")
 
 CPF_REGEX = re.compile(r"(\d{11})")  # procura 11 dígitos seguidos no nome do arquivo
 
@@ -73,8 +84,10 @@ def extrair_cpf_do_nome(filename: str) -> str | None:
 
 
 def registrar_log(cpf, file_path, status, message=""):
+    cpf_safe = _cpf_masked(cpf)
+    file_path_safe = mask_cpf_in_text(file_path)
     header = ["timestamp", "cpf", "file", "status", "message"]
-    row = [datetime.now().isoformat(), cpf, file_path, status, message]
+    row = [datetime.now().isoformat(), cpf_safe, file_path_safe, status, message]
     file_exists = os.path.isfile(LOG_CSV)
     with open(LOG_CSV, "a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
@@ -217,6 +230,7 @@ def filtrar_todas_obras(page):
 
 
 def pesquisar_funcionario(page, cpf: str, nome_hint: str | None = None) -> bool:
+    cpf_safe = _cpf_masked(cpf)
     busca = SEL_BUSCA(page)
     
     # Tentativa com recuperação automática
@@ -261,7 +275,7 @@ def pesquisar_funcionario(page, cpf: str, nome_hint: str | None = None) -> bool:
          return False
          
     page.wait_for_timeout(2500)
-    registrar_screenshot(page, f"busca_input_{cpf}")
+    registrar_screenshot(page, f"busca_input_{cpf_safe}")
 
     # Tenta clicar em link do candidato (CPF ou nome)
     candidatos = []
@@ -287,8 +301,8 @@ def pesquisar_funcionario(page, cpf: str, nome_hint: str | None = None) -> bool:
                     texto_card = cand.first.inner_text()
                 except Exception:
                     pass
-                registrar_screenshot(page, f"busca_{cpf}")
-                logging.info(f"Selecionando resultado da busca para CPF {cpf}: {texto_card or cpf}")
+                registrar_screenshot(page, f"busca_{cpf_safe}")
+                logging.info(f"Selecionando resultado da busca para CPF {cpf_safe}: {texto_card or cpf_safe}")
                 try:
                     cand.first.scroll_into_view_if_needed(timeout=3000)
                 except Exception:
@@ -310,7 +324,7 @@ def pesquisar_funcionario(page, cpf: str, nome_hint: str | None = None) -> bool:
     # Antigamente o script clicava em qualquer card, o que causava ERROS GRAVES.
     # Agora retornamos False para que o arquivo vá para a pasta de ERROS.
     
-    registrar_screenshot(page, f"busca_falha_{cpf}")
+    registrar_screenshot(page, f"busca_falha_{cpf_safe}")
     logging.warning(f"Busca falhou para '{termo_busca}'. Nenhum resultado exato encontrado.")
     return False
 
@@ -332,6 +346,7 @@ def entrar_ver_processo(page):
 
 
 def tentar_processo(page, link_locator, file_path_abs: str, cpf: str, idx: int) -> bool:
+    cpf_safe = _cpf_masked(cpf)
     """Clica em um link 'Ver processo', tenta abrir Exame Admissional e anexar. Retorna sucesso/fracasso."""
     try:
         link_locator.wait_for(timeout=12000)
@@ -351,8 +366,8 @@ def tentar_processo(page, link_locator, file_path_abs: str, cpf: str, idx: int) 
         anexar_exame(page, file_path_abs, cpf)
         return True
     except Exception as e:
-        logging.warning(f"Falha ao processar link Ver processo #{idx} para CPF {cpf}: {e}")
-        registrar_screenshot(page, f"ver_processo_falha_{cpf}_{idx}")
+        logging.warning(f"Falha ao processar link Ver processo #{idx} para CPF {cpf_safe}: {e}")
+        registrar_screenshot(page, f"ver_processo_falha_{cpf_safe}_{idx}")
         try:
             page.go_back(timeout=8000)
             page.wait_for_timeout(800)
@@ -454,24 +469,25 @@ def abrir_exame_admissional(page):
 
 
 def anexar_exame(page, file_path: str, cpf: str):
+    cpf_safe = _cpf_masked(cpf)
     if not os.path.isfile(file_path):
         raise RuntimeError(f"Arquivo não encontrado para upload: {file_path}")
 
     # --- VERIFICAÇÃO DE ESTADO JÁ EXISTENTE ---
     if page.locator("text=Esse documento já foi aprovado").count() > 0:
-        msg = f"⏩  Pular: Documento JÁ APROVADO para {cpf}"
+        msg = f"⏩  Pular: Documento JÁ APROVADO para {cpf_safe}"
         print(msg)
         logging.info(msg)
         return
     
     if page.locator("text=Em validação").count() > 0:
-        msg = f"⏩  Pular: Documento EM VALIDAÇÃO para {cpf}"
+        msg = f"⏩  Pular: Documento EM VALIDAÇÃO para {cpf_safe}"
         print(msg)
         logging.info(msg)
         return
 
     if page.locator("button:has-text('Editar documento')").count() > 0:
-        msg = f"⏩  Pular: Botão Editar encontrado (já existe) para {cpf}"
+        msg = f"⏩  Pular: Botão Editar encontrado (já existe) para {cpf_safe}"
         print(msg)
         logging.info(msg)
         return
@@ -535,7 +551,7 @@ def anexar_exame(page, file_path: str, cpf: str):
             
             # Checagem de "Já existe" / Modal de erro
             if page.locator("text=Documento já existe").count() > 0:
-                logging.info(f"Yube informou que documento já existe para {cpf}.")
+                logging.info(f"Yube informou que documento já existe para {cpf_safe}.")
                 # Clica em cancelar ou fechar se precisar
                 return
             continue
@@ -565,7 +581,7 @@ def anexar_exame(page, file_path: str, cpf: str):
 
     # aguarda conclusão do upload/salvar e registra evidência
     page.wait_for_timeout(UPLOAD_WAIT_MS)
-    registrar_screenshot(page, f"upload_pos_{cpf}")
+    registrar_screenshot(page, f"upload_pos_{cpf_safe}")
     # aguarda pós-salvar para garantir processamento
     page.wait_for_timeout(POST_SAVE_WAIT_MS)
 
@@ -574,8 +590,9 @@ def processar_arquivo(page, file_path: str):
     filename = os.path.basename(file_path)
     nome_hint = os.path.splitext(filename)[0].split(" - ")[0].strip()
     cpf = extrair_cpf_do_nome(filename)
+    cpf_safe = _cpf_masked(cpf)
 
-    print(f"📄  Processando: {filename} (CPF: {cpf})")
+    print(f"📄  Processando: {filename} (CPF: {cpf_safe})")
     
     # Mover arquivo para "em processamento" antes de iniciar
     arquivo_em_processamento = None
@@ -615,7 +632,7 @@ def processar_arquivo(page, file_path: str):
             logging.warning(f"Busca falhou para '{tentativa}'.")
 
     if not ok_busca:
-        print(f"❌  Funcionário não encontrado: {cpf} (Tentativas: {nome_tentativas})")
+        print(f"?  Funcion?rio n?o encontrado: {cpf_safe} (Tentativas: {nome_tentativas})")
         # Se falhou tudo, salva erro e vai pro próximo
         registrar_log(cpf, file_path, "erro", "Funcionario nao encontrado na busca")
         try:
@@ -641,7 +658,7 @@ def processar_arquivo(page, file_path: str):
         if not sucesso:
             raise RuntimeError("Nenhum processo abriu ou permitiu anexar.")
     except Exception as e:
-        logging.exception(f"Falha no fluxo para {cpf}: {e}")
+        logging.exception(f"Falha no fluxo para {cpf_safe}: {e}")
         registrar_log(cpf, file_path, "erro", str(e))
         try:
             destino_erro = os.path.join(PASTA_ERROS, filename)
@@ -654,7 +671,7 @@ def processar_arquivo(page, file_path: str):
         
         # tentativa de screenshot para depurar
         try:
-            page.screenshot(path=os.path.join(PASTA_LOGS_RPA, f"error_{cpf}_{int(time.time())}.png"))
+            page.screenshot(path=os.path.join(PASTA_LOGS_RPA, f"error_{cpf_safe}_{int(time.time())}.png"))
         except Exception:
             pass
         return False
