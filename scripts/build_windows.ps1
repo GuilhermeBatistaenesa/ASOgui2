@@ -18,11 +18,19 @@ $env:PLAYWRIGHT_BROWSERS_PATH = "0"
 & $python -m playwright install chromium
 
 $distDir = Join-Path $root "dist\\ASOgui"
-$vendorTesseract = Join-Path $root "vendor\\tesseract\\tesseract.exe"
+$vendorTesseractDir = Join-Path $root "vendor\\tesseract"
+$vendorTesseractExe = Join-Path $vendorTesseractDir "tesseract.exe"
+$vendorTesseractAltDir = Join-Path $vendorTesseractDir "Tesseract-OCR"
+$vendorTesseractAltExe = Join-Path $vendorTesseractAltDir "tesseract.exe"
 $vendorPoppler = Join-Path $root "vendor\\poppler\\bin"
 
-if (-not (Test-Path $vendorTesseract)) {
-  Write-Error "Missing vendor tesseract: $vendorTesseract"
+$tessSourceDir = $null
+if (Test-Path $vendorTesseractExe) {
+  $tessSourceDir = $vendorTesseractDir
+} elseif (Test-Path $vendorTesseractAltExe) {
+  $tessSourceDir = $vendorTesseractAltDir
+} else {
+  Write-Error "Missing vendor tesseract: $vendorTesseractExe (or $vendorTesseractAltExe)"
 }
 if (-not (Test-Path $vendorPoppler)) {
   Write-Error "Missing vendor poppler bin: $vendorPoppler"
@@ -44,7 +52,7 @@ if (-not (Test-Path $vendorPoppler)) {
 $toolsDir = Join-Path $distDir "tools"
 New-Item -ItemType Directory -Force -Path (Join-Path $toolsDir "tesseract") | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $toolsDir "poppler") | Out-Null
-Copy-Item $vendorTesseract -Destination (Join-Path $toolsDir "tesseract\\tesseract.exe") -Force
+Copy-Item (Join-Path $tessSourceDir "*") -Destination (Join-Path $toolsDir "tesseract") -Recurse -Force
 Copy-Item $vendorPoppler -Destination (Join-Path $toolsDir "poppler\\bin") -Recurse -Force
 
 # Copy .env if exists, otherwise create a default
@@ -73,9 +81,12 @@ if ($pwSrc) {
 
 # VERSION.txt
 $ver = "0.0.0"
-$versionFile = Join-Path $root "VERSION.txt"
-if (Test-Path $versionFile) {
-  $ver = (Get-Content $versionFile | Select-Object -First 1).Trim()
+$versionFile1 = Join-Path $root "version.txt"
+$versionFile2 = Join-Path $root "VERSION.txt"
+if (Test-Path $versionFile1) {
+  $ver = (Get-Content $versionFile1 | Select-Object -First 1).Trim()
+} elseif (Test-Path $versionFile2) {
+  $ver = (Get-Content $versionFile2 | Select-Object -First 1).Trim()
 }
 Set-Content -Path (Join-Path $distDir "VERSION.txt") -Value $ver -Encoding UTF8
 

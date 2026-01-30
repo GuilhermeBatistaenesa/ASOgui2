@@ -115,4 +115,4 @@ def test_email_subject_contains_execution_id_and_status(tmp_path, mocker):
 
 
 def test_mask_cpf():
-    assert mask_cpf("12345678900") == "***.***.*90-00"
+    assert mask_cpf("12345678900") == "***.***.**9-00"

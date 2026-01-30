@@ -5,23 +5,43 @@ from outcomes import SKIPPED_NO_RECIPIENT
 from utils_masking import mask_cpf_in_text
 
 
+def _get_env_recipients():
+    raw = os.getenv("ASO_NOTIFY_TO") or os.getenv("ASO_EMAIL_TO") or ""
+    parts = [p.strip() for p in raw.replace(",", ";").split(";") if p.strip()]
+    return ";".join(parts)
+
+
+def _get_env_sender():
+    return os.getenv("ASO_EMAIL_FROM") or os.getenv("ASO_EMAIL_ACCOUNT") or ""
+
+
 def enviar_resumo_email(destinatario, relatorio, execution_id, run_status, report_paths=None, manifest_path=None, logger=None):
     """
     Envia email de resumo com anexos.
     Retorna (status, error_message)
     """
+    env_to = _get_env_recipients()
+    if env_to:
+        destinatario = env_to
+
     if not destinatario:
-        msg = "DestinatÃ¡rio de email nÃ£o configurado. Pulo envio."
+        msg = "Destinatario de email nao configurado. Pulo envio."
         if logger:
             logger.warning(msg, step="email")
         else:
-            print(f"âš  {msg}")
+            print(f"[WARN] {msg}")
         return (SKIPPED_NO_RECIPIENT, msg)
 
     try:
         outlook = win32.Dispatch('outlook.application')
         mail = outlook.CreateItem(0)
         mail.To = destinatario
+        sender = _get_env_sender()
+        if sender:
+            try:
+                mail.SentOnBehalfOfName = sender
+            except Exception:
+                pass
         date_str = datetime.now().strftime('%Y-%m-%d')
         mail.Subject = f"[ASO] {run_status} | {date_str} | exec={execution_id}"
 
@@ -47,7 +67,7 @@ def enviar_resumo_email(destinatario, relatorio, execution_id, run_status, repor
             </style>
         </head>
         <body>
-            <h2>Resumo da ExecuÃ§Ã£o RPA ASO</h2>
+            <h2>Resumo da Execucao RPA ASO</h2>
             <p><strong>Execution ID:</strong> {execution_id}</p>
             <p><strong>Status:</strong> {run_status}</p>
 
@@ -66,7 +86,7 @@ def enviar_resumo_email(destinatario, relatorio, execution_id, run_status, repor
                 {erros_html}
             </table>
 
-            <h3>EvidÃªncias</h3>
+            <h3>Evidencias</h3>
             <ul>
                 <li>Report JSON: {report_paths.get('json') if report_paths else 'N/A'}</li>
                 <li>Resumo MD: {report_paths.get('md') if report_paths else 'N/A'}</li>
@@ -89,11 +109,11 @@ def enviar_resumo_email(destinatario, relatorio, execution_id, run_status, repor
         if logger:
             logger.info(f"Email enviado para {destinatario}", step="email")
         else:
-            print(f"ðŸ“§ Email enviado para {destinatario}")
+            print(f"Email enviado para {destinatario}")
         return ("SENT", None)
     except Exception as e:
         if logger:
             logger.error(f"Erro ao enviar email: {e}", step="email")
         else:
-            print(f"âŒ Erro ao enviar email: {e}")
+            print(f"[ERROR] Erro ao enviar email: {e}")
         return ("FAILED", str(e))

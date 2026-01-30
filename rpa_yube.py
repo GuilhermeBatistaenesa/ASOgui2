@@ -53,8 +53,7 @@ Path(PASTA_LOGS_RPA).mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
     handlers=[
-        logging.FileHandler(os.path.join(PASTA_LOGS_RPA, "rpa_yube_debug.log"), encoding='utf-8'),
-        logging.StreamHandler()
+        logging.FileHandler(os.path.join(PASTA_LOGS_RPA, "rpa_yube_debug.log"), encoding='utf-8')
     ],
     level=logging.INFO
 )
@@ -163,7 +162,7 @@ def login(page):
     # Se NÃO tem input de senha, força a navegação para login direto (evita nova aba)
     if SEL_EMAIL(page).count() == 0:
         try:
-            print("🔄  Redirecionando para página de login direta...")
+            print("INFO: Redirecionando para pagina de login direta...")
             page.goto("https://app.yube.com.br/login", timeout=15000)
             page.wait_for_timeout(2000)
             target_page = page
@@ -179,7 +178,7 @@ def login(page):
         pass
 
     # preencher credenciais
-    print("🔑  Preenchendo credenciais...")
+    print("INFO: Preenchendo credenciais...")
     try:
         # Se ainda assim não aparecer, tenta esperar
         target_page.wait_for_selector("#username", state="visible", timeout=10000)
@@ -187,7 +186,7 @@ def login(page):
         target_page.wait_for_selector("input[name='password']", state="visible", timeout=10000)
         SEL_SENHA(target_page).fill(YUBE_PASS)
         SEL_ENTRAR(target_page).click()
-        print("✅  Login submetido.")
+        print("INFO: Login submetido.")
     except Exception as e:
         # Se falhar o login, mas já estiver logado (redirecionou para home), tudo bem
         if SEL_BUSCA(target_page).count() > 0:
@@ -466,16 +465,16 @@ def abrir_exame_admissional(page):
         
         for ind in indicators:
             if page.locator(ind).is_visible():
-                print("✅  Aba 'Exame Admissional' detectada/aberta.")
+                print("INFO: Aba 'Exame Admissional' detectada/aberta.")
                 registrar_screenshot(page, "exame_adm_ok")
                 return
 
         # Tentativa final: Seletor genérico de upload visível
         if page.locator(".ant-upload").is_visible():
-             print("✅  Área de upload detectada.")
+             print("INFO: Area de upload detectada.")
              return
 
-        logging.error("CRÍTICO: Não encontrou aba 'Exame Admissional' e contexto não match.")
+        logging.error("CRITICO: Nao encontrou aba 'Exame Admissional' e contexto nao match.")
         raise RuntimeError("Aba 'Exame Admissional' não encontrada ou não abriu.")
 
     except Exception as e:
@@ -491,19 +490,19 @@ def anexar_exame(page, file_path: str, cpf: str):
 
     # --- VERIFICAÇÃO DE ESTADO JÁ EXISTENTE ---
     if page.locator("text=Esse documento já foi aprovado").count() > 0:
-        msg = f"⏩  Pular: Documento JÁ APROVADO para {cpf_safe}"
+        msg = f"INFO: Pular: Documento JA APROVADO para {cpf_safe}"
         print(msg)
         logging.info(msg)
         return
     
     if page.locator("text=Em validação").count() > 0:
-        msg = f"⏩  Pular: Documento EM VALIDAÇÃO para {cpf_safe}"
+        msg = f"INFO: Pular: Documento EM VALIDACAO para {cpf_safe}"
         print(msg)
         logging.info(msg)
         return
 
     if page.locator("button:has-text('Editar documento')").count() > 0:
-        msg = f"⏩  Pular: Botão Editar encontrado (já existe) para {cpf_safe}"
+        msg = f"INFO: Pular: Botao Editar encontrado (ja existe) para {cpf_safe}"
         print(msg)
         logging.info(msg)
         return
@@ -608,7 +607,7 @@ def processar_arquivo(page, file_path: str):
     cpf = extrair_cpf_do_nome(filename)
     cpf_safe = _cpf_masked(cpf)
 
-    print(f"📄  Processando: {filename} (CPF: {cpf_safe})")
+    print(f"INFO: Processando: {filename} (CPF: {cpf_safe})")
     
     # Mover arquivo para "em processamento" antes de iniciar
     arquivo_em_processamento = None
@@ -640,7 +639,7 @@ def processar_arquivo(page, file_path: str):
     ok_busca = False
     for tentativa in nome_tentativas:
         if not tentativa: continue
-        logging.info(f"🔎 Buscando por: '{tentativa}'")
+        logging.info(f"INFO: Buscando por: '{tentativa}'")
         if pesquisar_funcionario(page, cpf, nome_hint=tentativa):
             ok_busca = True
             break

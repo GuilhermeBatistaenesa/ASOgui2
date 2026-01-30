@@ -1,79 +1,59 @@
+# ASOgui (Automacao de ASO)
 
-# ASO Automation Project
+## Visao geral
+Este projeto automatiza o recebimento e o cadastro de Atestados de Saude Ocupacional (ASO) a partir do Outlook. O fluxo busca emails, processa anexos PDF com OCR, extrai dados (nome, CPF, data e funcao) e integra com o bot RPA. Ao final, gera relatorios e envia notificacoes.
 
-## Visão Geral
-Este projeto automatiza o processamento de Atestados de Saúde Ocupacional (ASO) recebidos via e-mail.
-O sistema monitora uma caixa de entrada do Outlook, identifica e-mails contendo ASOs, extrai informações via OCR (Tesseract) e integra com um sistema RPA (Yube).
+## Principais recursos
+- Integracao com Outlook via COM (Windows)
+- OCR com Tesseract + conversao PDF com Poppler
+- Regras de validacao (ASO x rascunho x nao ASO)
+- Relatorios JSON + resumo Markdown
+- Runner/Updater para instalacao onedir com atualizacao via rede ou GitHub
+- Scripts de build e atalhos .bat para uso sem terminal
 
-## Funcionalidades Principais
-- **Monitoramento de E-mail**: Verifica a caixa de entrada em busca de e-mails com assuntos padronizados.
-- **Processamento de PDF**: Converte PDFs em imagens e aplica OCR para extração de dados.
-- **Extração de Dados**: Identifica Nome, CPF, Data do ASO e Função/Cargo.
-- **Integração RPA**: Prepara os arquivos e aciona o bot RPA para cadastro.
-- **Relatórios**: Gera relatórios JSON e envia resumos por e-mail.
+## Requisitos
+- Windows 10/11 com Microsoft Outlook configurado
+- Python 3.10+ (para executar localmente)
+- Tesseract OCR e Poppler (incluidos no pacote quando buildado)
 
-## Pré-requisitos
-
-### Sistema
-- **Windows OS** (Necessário para automação via `win32com` Outlook).
-- **Microsoft Outlook** instalado e configurado com a conta alvo.
-- **Tesseract OCR**:
-  - Instalar o [Tesseract OCR for Windows](https://github.com/UB-Mannheim/tesseract/wiki).
-  - Adicionar ao PATH ou configurar no `.env`.
-- **Poppler**:
-  - Necessário para `pdf2image`.
-  - Baixar e extrair o binário, configurar caminho no `.env`.
-
-### Python
-- Python 3.10+
-- Dependências listadas em `requirements.txt`.
-
-## Instalação
-
-1. Clone o repositório.
-2. Instale as dependências:
+## Configuracao rapida
+1) Copie `.env.example` para `.env` e ajuste as variaveis.
+2) Instale dependencias:
    ```bash
    pip install -r requirements.txt
    ```
-3. Configure o arquivo `.env`:
-   - Copie `.env.example` para `.env`.
-   - Preencha os caminhos do Tesseract, Poppler e conta de e-mail.
+3) Rode o fluxo:
+   - Terminal: `python main.py`
+   - Clique: `run_main.bat`
 
-## Configuração (.env)
-```ini
-# Exemplo
-TESSERACT_PATH=C:\Program Files\Tesseract-OCR\tesseract.exe
-POPPLER_PATH=C:\Installs\poppler-24.08.0\Library\bin
-ASO_EMAIL_ACCOUNT=aso@enesa.com.br
-ASO_MAILBOX_NAME=Aso
-ASO_DAYS_BACK=0  # 0 = Apenas hoje
-```
+## Atalhos .bat (sem terminal)
+- `run_main.bat` -> executa `main.py`
+- `run_tests.bat` -> executa pytest
+- `build_zip.bat [patch|minor|major|1.2.3]` -> gera ZIP + latest.json + sha256
+- `build_windows.bat` -> gera `dist\ASOgui` (onedir)
 
-## Utilização
-
-Para rodar o processo manualmente:
+## Build e release
+Build recomendado (gera ZIP de release):
 ```bash
-python main.py
+powershell -ExecutionPolicy Bypass -File scripts\build_aso_zip.ps1
 ```
-O script irá:
-1. Ler os e-mails do dia (ou janela configurada).
-2. Baixar e processar anexos.
-3. Gerar arquivos na pasta de rede configurada.
-4. Acionar o RPA.
-5. Enviar um e-mail de resumo ao final.
+- O script aumenta a versao automaticamente (patch). Para `minor`/`major`, use `-Bump`.
+- O ZIP e o `latest.json` sao gravados em `dist\`.
 
-## Estrutura de Pastas
-- `main.py`: Script principal de orquestração.
-- `custom_logger.py`: Módulo de logs estruturados.
-- `reporting.py`: Geração de relatórios JSON.
-- `notification.py`: Envio de e-mail de resumo.
-- `aso_admissional_email.py`: (Legado/Alternativo) Módulo de e-mail.
-- `logs/`: Logs de execução.
-- `relatorios/`: Relatórios gerados.
-- `tests/`: Testes automatizados.
+## Estrutura do projeto
+- `main.py`: orquestracao principal
+- `runner.py`: updater/launcher (instalacao onedir)
+- `reporting.py`: relatorios
+- `notification.py`: email de resumo
+- `utils_masking.py`: mascaramento de PII (CPF)
+- `scripts/`: builds e empacotamento
+- `tests/`: testes automatizados
 
 ## Testes
-Para executar os testes unitários:
 ```bash
-pytest tests/
+python -m pytest
 ```
+Ou clique em `run_tests.bat`.
+
+## Documentacao completa
+Leia `docs/DOCUMENTACAO_OFICIAL.md` para detalhes corporativos, arquitetura, operacao e troubleshooting.

@@ -1,5 +1,11 @@
 ﻿param(
+
     [string]$Version = ""
+
+    [ValidateSet("major","minor","patch")]
+
+    [string]$Bump = "patch"
+
 )
 
 $ErrorActionPreference = "Stop"
@@ -8,7 +14,10 @@ $distDir = Join-Path $repoRoot "dist"
 $buildDir = Join-Path $repoRoot "build"
 $outDir = Join-Path $env:TEMP "aso_dist"
 $workDir = Join-Path $env:TEMP "aso_build"
-$vendorTess = Join-Path $repoRoot "vendor\tesseract\tesseract.exe"
+$vendorTessDir = Join-Path $repoRoot "vendor\tesseract"
+$vendorTessExe = Join-Path $vendorTessDir "tesseract.exe"
+$vendorTessAltDir = Join-Path $vendorTessDir "Tesseract-OCR"
+$vendorTessAltExe = Join-Path $vendorTessAltDir "tesseract.exe"
 $vendorPoppler = Join-Path $repoRoot "vendor\poppler\bin"
 
 $pythonExe = $null
@@ -69,15 +78,32 @@ New-Item -ItemType Directory -Force -Path $workDir | Out-Null
   --collect-all PIL
 Pop-Location
 
-# Determine version
+# Determine version (auto-bump when not provided)
 if ([string]::IsNullOrWhiteSpace($Version)) {
     $vf1 = Join-Path $repoRoot "version.txt"
     $vf2 = Join-Path $repoRoot "VERSION.txt"
     if (Test-Path $vf1) { $Version = (Get-Content $vf1 -Raw).Trim() }
     elseif (Test-Path $vf2) { $Version = (Get-Content $vf2 -Raw).Trim() }
     else { $Version = "0.0.0" }
-}
 
+    if ($Version -notmatch ^(\d+)\.(\d+)\.(\d+)$) {
+        throw "Invalid version format $Version. Use SemVer like 1.2.3 or pass -Version explicitly."
+    }
+
+    $major = [int]$matches[1]
+    $minor = [int]$matches[2]
+    $patch = [int]$matches[3]
+    switch ($Bump) {
+        "major" { $major++; $minor = 0; $patch = 0 }
+        "minor" { $minor++; $patch = 0 }
+        default { $patch++ }
+    }
+    $Version = "{0}.{1}.{2}" -f $major, $minor, $patch
+
+    # Persist bumped version for next build
+    Set-Content -Path $vf1 -Value $Version -Encoding ascii
+    Set-Content -Path $vf2 -Value $Version -Encoding ascii
+}
 # Copy tools
 $pkgDir = Join-Path $outDir "ASOgui"
 $toolsDir = Join-Path $pkgDir "tools"
@@ -87,10 +113,15 @@ $toolsPopplerDir = Join-Path $toolsDir "poppler\bin"
 New-Item -ItemType Directory -Force -Path $toolsTessDir | Out-Null
 New-Item -ItemType Directory -Force -Path $toolsPopplerDir | Out-Null
 
-if (-not (Test-Path $vendorTess)) {
-    throw "Missing vendor tesseract at: $vendorTess"
+$tessSourceDir = $null
+if (Test-Path $vendorTessExe) {
+    $tessSourceDir = $vendorTessDir
+} elseif (Test-Path $vendorTessAltExe) {
+    $tessSourceDir = $vendorTessAltDir
+} else {
+    throw "Missing vendor tesseract at: $vendorTessExe (or $vendorTessAltExe)"
 }
-Copy-Item $vendorTess (Join-Path $toolsTessDir "tesseract.exe") -Force
+Copy-Item (Join-Path $tessSourceDir "*") $toolsTessDir -Recurse -Force
 
 if (-not (Test-Path $vendorPoppler)) {
     throw "Missing vendor poppler bin at: $vendorPoppler"

@@ -27,6 +27,7 @@ from datetime import datetime, timedelta
 import traceback
 import hashlib
 import time
+from PIL import ImageOps, ImageFilter
 from rpa_yube import run_from_main
 
 # Módulos customizados
@@ -113,12 +114,114 @@ TARGET_ACCOUNT = os.getenv("ASO_EMAIL_ACCOUNT", "aso@enesa.com.br")
 
 
 # ====================================================================
-# FUNÇÃO DE LOG (Wrapper para o logger estruturado)
+# FUNCAO - EXTRAI DADOS COMPLETOS (OCR)
+# ====================================================================
+def _score_ocr(texto):
+    if not texto:
+        return 0
+    score = 0
+    t = texto.upper()
+    if "CPF" in t:
+        score += 3
+    if "ASO" in t or "SAUDE OCUPACIONAL" in t or "SA?DE OCUPACIONAL" in t:
+        score += 2
+    if re.search(r"\d{3}\.\d{3}\.\d{3}-\d{2}", texto):
+        score += 3
+    if re.search(r"\d{11}", texto):
+        score += 2
+    if "FUNCION" in t:
+        score += 1
+    return score
+
+
+def _preprocess_img(img, scale=1.5):
+    try:
+        gray = ImageOps.grayscale(img)
+        if scale and scale != 1.0:
+            w, h = gray.size
+            gray = gray.resize((int(w * scale), int(h * scale)))
+        gray = ImageOps.autocontrast(gray)
+        gray = gray.filter(ImageFilter.MedianFilter(size=3))
+        gray = gray.filter(ImageFilter.SHARPEN)
+        bw = gray.point(lambda x: 0 if x < 180 else 255, mode="1")
+        return bw
+    except Exception:
+        return img
+
+
+def ocr_with_fallback(img, force_full=False):
+    # Primeira tentativa rapida
+    try:
+        base = pytesseract.image_to_string(img, lang="por+eng", config="--oem 3 --psm 6")
+    except Exception:
+        base = ""
+
+    # Se a leitura base ja tem sinais bons, retorna sem fallback
+    if not force_full and _score_ocr(base) >= 5:
+        return base
+
+    # Fallbacks so quando falhar
+    configs = [
+        "--oem 3 --psm 11",
+        "--oem 3 --psm 4",
+    ]
+    texts = [base]
+    for cfg in configs:
+        try:
+            t = pytesseract.image_to_string(img, lang="por+eng", config=cfg)
+            texts.append(t)
+        except Exception:
+            texts.append("")
+    pre = _preprocess_img(img)
+    for cfg in configs:
+        try:
+            t = pytesseract.image_to_string(pre, lang="por+eng", config=cfg)
+            texts.append(t)
+        except Exception:
+            texts.append("")
+
+    best = ""
+    best_score = -1
+    for t in texts:
+        s = _score_ocr(t)
+        if s > best_score:
+            best_score = s
+            best = t
+    return best
+
 # ====================================================================
 def registrar_log(msg, context=None):
     # Mantém compatibilidade com chamadas existentes
     logger.info(msg, extra=context)
 
+def salvar_diagnostico_resumo(stats, manifest_path=None, report_paths=None, extra=None):
+    try:
+        os.makedirs(PASTA_LOGS, exist_ok=True)
+        path = os.path.join(PASTA_LOGS, "diagnostico_ultima_execucao.txt")
+        lines = []
+        lines.append(f"execution_id: {stats.get('execution_id')}")
+        lines.append(f"started_at: {stats.get('started_at')}")
+        lines.append(f"finished_at: {stats.get('finished_at')}")
+        lines.append(f"run_status: {stats.get('run_status')}")
+        lines.append(f"total_detected: {stats.get('total_detected')}")
+        lines.append(f"total_processed: {stats.get('total_processed')}")
+        lines.append(f"success: {stats.get('success')}")
+        lines.append(f"error: {stats.get('error')}")
+        lines.append(f"skipped_duplicate: {stats.get('skipped_duplicate')}")
+        lines.append(f"skipped_draft: {stats.get('skipped_draft')}")
+        lines.append(f"skipped_non_aso: {stats.get('skipped_non_aso')}")
+        if manifest_path:
+            lines.append(f"manifest: {manifest_path}")
+        if report_paths:
+            lines.append(f"report_json: {report_paths.get('json')}")
+            lines.append(f"report_md: {report_paths.get('md')}")
+        if extra:
+            for k, v in extra.items():
+                lines.append(f"{k}: {v}")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+    except Exception:
+        pass
 
 # ====================================================================
 # HASH DE ARQUIVO
@@ -150,13 +253,13 @@ def eh_aso(texto_ocr):
 # ====================================================================
 # FUNÇÃO - EXTRAI DADOS COMPLETOS (OCR)
 # ====================================================================
-def extrair_dados_completos(img, texto_ocr=None):
+def extrair_dados_completos(img, texto_ocr=None, _retry=False):
     """
     Retorna: nome, cpf, data_aso, funcao_cargo, texto_ocr
     """
     if texto_ocr is None:
         try:
-            texto_ocr = pytesseract.image_to_string(img, lang="por+eng")
+            texto_ocr = ocr_with_fallback(img)
         except Exception as e:
             texto_ocr = ""
             registrar_log(f"Erro no pytesseract: {e}")
@@ -227,16 +330,27 @@ def extrair_dados_completos(img, texto_ocr=None):
                 nome = candidato
                 break
             
-    # Debug para casos falhos
+    # Fallback: nome imediatamente antes do CPF
     if nome == "Desconhecido":
-        registrar_log(f"DEBUG OCR FALHO (CPF={mask_cpf(cpf)}): Texto parcial: {texto[:200].replace(chr(10), ' ')}")
-        # Fallback: nome imediatamente antes do CPF
         bloco = re.search(
             r"([A-ZÀ-Ý][A-ZÀ-Ý \-]{5,150})\s+(?:CPF|C\.P\.F)",
             texto
         )
         if bloco:
             nome = bloco.group(1).strip()
+
+    # Se nome ainda desconhecido, tentar um OCR mais agressivo uma unica vez
+    if nome == "Desconhecido" and not _retry:
+        try:
+            texto2 = ocr_with_fallback(img, force_full=True)
+        except Exception:
+            texto2 = ""
+        if texto2 and texto2 != texto_ocr:
+            return extrair_dados_completos(img, texto_ocr=texto2, _retry=True)
+
+    # Debug para casos falhos (apos fallback)
+    if nome == "Desconhecido":
+        registrar_log(f"DEBUG OCR FALHO (CPF={mask_cpf(cpf)}): Texto parcial: {texto[:200].replace(chr(10), ' ')}")
 
     # >>> HEURÍSTICA: Se ainda desconhecido, procurar nas linhas acima do CPF
     if nome == "Desconhecido":
@@ -309,10 +423,10 @@ def extrair_dados_completos(img, texto_ocr=None):
         
     # --- DIAGNÓSTICO PARA O USUÁRIO ---
     if cpf == "CPF_Desconhecido":
-        print(f"⚠️  ALERTA DE LEITURA: Não foi possível ler o CPF neste arquivo.")
+        print("ALERTA DE LEITURA: Nao foi possivel ler o CPF neste arquivo.")
         registrar_log(f"DEBUG OCR: Falha CPF", context={"partial_text": texto[:100], "status": "CPF_MISSING"})
     elif nome == "Desconhecido":
-        print(f"⚠️  ALERTA DE LEITURA: CPF encontrato ({mask_cpf(cpf)}), mas NOME não identificado.")
+        print(f"ALERTA DE LEITURA: CPF encontrado ({mask_cpf(cpf)}), mas NOME nao identificado.")
         registrar_log(f"DEBUG OCR: Falha Nome", context={"cpf": cpf, "partial_text": texto[:100], "status": "NAME_MISSING"})
     else:
         # Sucesso parcial (debug)
@@ -421,7 +535,7 @@ def salvar_paginas_individualmente(pdf_path, pasta_destino, numero_obra, lista_n
     for i, img in enumerate(imagens, start=1):
         try:
             try:
-                texto_ocr = pytesseract.image_to_string(img, lang="por+eng")
+                texto_ocr = ocr_with_fallback(img)
             except Exception as e:
                 texto_ocr = ""
                 registrar_log(f"Erro no pytesseract: {e}")
@@ -434,13 +548,24 @@ def salvar_paginas_individualmente(pdf_path, pasta_destino, numero_obra, lista_n
 
             outcome = None
             outcome_msg = None
-            if nome == "RASCUNHO" or cpf == "Ignorar":
+            if nome == "Desconhecido" or cpf == "CPF_Desconhecido":
+                outcome = ERROR
+                outcome_msg = "Falha OCR (nome/cpf)"
+                if stats is not None:
+                    stats["error"] += 1
+                    stats["erros"].append({"arquivo": f"{os.path.basename(pdf_path)}#pg{i}", "erro": outcome_msg})
+                    stats["ocr_failures"].append({
+                        "arquivo": f"{os.path.basename(pdf_path)}#pg{i}",
+                        "cpf": mask_cpf(cpf),
+                        "nome": nome
+                    })
+            if outcome is None and (nome == "RASCUNHO" or cpf == "Ignorar"):
                 outcome = SKIPPED_DRAFT
                 outcome_msg = "Rascunho detectado"
                 if stats is not None:
                     stats["skipped_draft"] += 1
                     stats["skipped_items"].append(f"{outcome}: {mask_cpf_in_text(os.path.basename(pdf_path))}#pg{i}")
-            elif not is_aso:
+            elif outcome is None and not is_aso:
                 outcome = SKIPPED_NON_ASO
                 outcome_msg = "Nao identificado como ASO"
                 if stats is not None:
@@ -661,6 +786,29 @@ def get_outlook_namespace_robusto(timeout_sec=60):
         raise
 
 def captar_emails(limit=200, execution_id=None, started_at=None, manifest=None):
+    def _get_msg_datetime(msg):
+        for attr in ("ReceivedTime", "SentOn", "CreationTime"):
+            try:
+                t = getattr(msg, attr)
+                if isinstance(t, datetime):
+                    if t.tzinfo:
+                        t = t.astimezone().replace(tzinfo=None)
+                    return t
+            except Exception:
+                continue
+        return None
+
+    def _get_shared_inbox(ns, smtp):
+        try:
+            recip = ns.CreateRecipient(smtp)
+            recip.Resolve()
+            if not getattr(recip, "Resolved", False):
+                return None
+            # 6 = olFolderInbox
+            return ns.GetSharedDefaultFolder(recip, 6)
+        except Exception:
+            return None
+
     def _capta_core():
         registrar_log("Iniciando leitura do Outlook...")
         anexos_processados = set()
@@ -711,13 +859,29 @@ def captar_emails(limit=200, execution_id=None, started_at=None, manifest=None):
                 inbox = conta_destino.Folders("Caixa de Entrada")
             except:
                 inbox = conta_destino.Folders("Inbox")
-        
+
             mensagens = inbox.Items
-            mensagens.Sort("ReceivedTime", True)
-        
+            try:
+                mensagens.Sort("[ReceivedTime]", True)
+            except Exception:
+                mensagens.Sort("ReceivedTime", True)
+
         except Exception as e:
             registrar_log(f"Erro ao acessar caixa de entrada: {e}")
-            return
+            # Fallback: tentar inbox compartilhado via recipient
+            inbox = _get_shared_inbox(outlook, EMAIL_DESEJADO)
+            if inbox is None:
+                return
+            try:
+                mensagens = inbox.Items
+                try:
+                    mensagens.Sort("[ReceivedTime]", True)
+                except Exception:
+                    mensagens.Sort("ReceivedTime", True)
+                registrar_log(f"Usando inbox compartilhado: {getattr(inbox, 'FolderPath', 'Desconhecido')}")
+            except Exception as e2:
+                registrar_log(f"Erro ao acessar inbox compartilhado: {e2}")
+                return
         
         
         
@@ -760,11 +924,13 @@ def captar_emails(limit=200, execution_id=None, started_at=None, manifest=None):
             'skipped_duplicate': 0,
             'skipped_draft': 0,
             'skipped_non_aso': 0,
+            'ocr_failures': [],
             'sucessos': [],
             'erros': [],
             'skipped_items': [],
             'tempo_total': ''
         }
+        last_error = None
         start_time_total = datetime.now()
         
         # Collect indices to iterate in reverse, to avoid issues with deleting items if that were ever implemented
@@ -772,6 +938,31 @@ def captar_emails(limit=200, execution_id=None, started_at=None, manifest=None):
         indices = list(range(1, min(limit, mensagens.Count) + 1))
         
         registrar_log(f"Total de mensagens na caixa de entrada: {mensagens.Count}")
+        # Se a caixa atual nao tiver emails de hoje, tenta inbox compartilhado
+        if EMAIL_DESEJADO:
+            try:
+                today_count = 0
+                for di in range(1, min(50, mensagens.Count) + 1):
+                    try:
+                        dmsg = mensagens.Item(di)
+                        drec = _get_msg_datetime(dmsg)
+                        if drec and drec.date() == inicio_hoje.date():
+                            today_count += 1
+                    except Exception:
+                        continue
+                if today_count == 0:
+                    shared_inbox = _get_shared_inbox(outlook, EMAIL_DESEJADO)
+                    if shared_inbox and shared_inbox is not inbox:
+                        shared_items = shared_inbox.Items
+                        try:
+                            shared_items.Sort("[ReceivedTime]", True)
+                        except Exception:
+                            shared_items.Sort("ReceivedTime", True)
+                        inbox = shared_inbox
+                        mensagens = shared_items
+                        registrar_log(f"Usando inbox compartilhado: {getattr(shared_inbox, 'FolderPath', 'Desconhecido')}")
+            except Exception:
+                pass
         
         for i in reversed(indices): # Changed from `for i in range(1, ...)` to `for i in reversed(indices)`
             try:
@@ -781,7 +972,9 @@ def captar_emails(limit=200, execution_id=None, started_at=None, manifest=None):
                 if getattr(msg, "Class", None) != 43:
                     continue
         
-                recebido = msg.ReceivedTime.replace(tzinfo=None)
+                recebido = _get_msg_datetime(msg)
+                if not recebido:
+                    continue
                 assunto = msg.Subject or ""
         
                 if not (inicio_janela <= recebido < inicio_amanha):
@@ -790,9 +983,9 @@ def captar_emails(limit=200, execution_id=None, started_at=None, manifest=None):
                 if recebido.date() == inicio_hoje.date():
                     encontrados_hoje += 1
         
-                # Padrão mais flexível: aceita variações no formato
+                # Padrao mais flexivel: aceita prefixos (ENC/RE/FW) e pequenas variacoes
                 m = re.search(
-                    r"ASO\s+ADMISSIONAL\s*-\s*([A-Za-z0-9]+)\s*-\s*([0-3]?\d/[0-1]?\d/\d{2,4})(?:\s*-\s*.*)?",
+                    r"(?:ENC:|RE:|FWD:|FW:)?\s*ASO\s+ADMISSIONAL\s*-\s*([A-Za-z0-9]+)\s*-\s*([0-3]?\d/[0-1]?\d/\d{2,4})(?:\s*-\s*.*)?",
                     assunto,
                     re.IGNORECASE
                 )
@@ -801,7 +994,7 @@ def captar_emails(limit=200, execution_id=None, started_at=None, manifest=None):
                     continue
         
                 numero_obra = m.group(1)
-                registrar_log(f"✓ Email compatível encontrado - Obra: {numero_obra} | Assunto: {assunto[:60]}...")
+                registrar_log(f"Email compativel encontrado - Obra: {numero_obra} | Assunto: {assunto[:60]}...")
         
                 anexos_pdf = []
                 total_attachments = msg.Attachments.Count
@@ -811,7 +1004,7 @@ def captar_emails(limit=200, execution_id=None, started_at=None, manifest=None):
                         anexos_pdf.append(att)
         
                 if not anexos_pdf:
-                    registrar_log(f"  ⚠ Nenhum anexo PDF encontrado neste email")
+                    registrar_log("  Aviso: Nenhum anexo PDF encontrado neste email")
                     continue
         
                 pasta_obra = os.path.join(PASTA_BASE, f"Obra_{numero_obra}")
@@ -844,8 +1037,9 @@ def captar_emails(limit=200, execution_id=None, started_at=None, manifest=None):
                         os.remove(temp_pdf)
         
                     except Exception as e:
-                        registrar_log(f"Erro ao processar anexo {idx}: {e}")
-                        stats_gerais['erros'].append({'arquivo': f"AnexoEmail_{idx}", 'erro': f"Erro extração PDF: {e}"})
+                        last_error = f"Erro ao processar anexo {idx}: {e}"
+                        registrar_log(last_error)
+                        stats_gerais['erros'].append({'arquivo': f"AnexoEmail_{idx}", 'erro': f"Erro extracao PDF: {e}"})
         
                 # ==================================================
                 # CHAMAR RPA YUBE PARA A PASTA GERADA (APENAS NOVOS)
@@ -881,7 +1075,8 @@ def captar_emails(limit=200, execution_id=None, started_at=None, manifest=None):
                                     })
         
                     except Exception as e:
-                        registrar_log(f"Erro ao executar RPA Yube: {e}")
+                        last_error = f"Erro ao executar RPA Yube: {e}"
+                        registrar_log(last_error)
                         stats_gerais['erros'].append({'arquivo': 'RPA_CRASH', 'erro': str(e)})
                         stats_gerais['error'] += 1
                 else:
@@ -890,7 +1085,8 @@ def captar_emails(limit=200, execution_id=None, started_at=None, manifest=None):
                 processados += 1
         
             except Exception as e:
-                registrar_log(f"Erro inesperado: {e}")
+                last_error = f"Erro inesperado: {e}"
+                registrar_log(last_error)
                 try:
                     erro_id = f"erro_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
                     pasta_erro = os.path.join(PASTA_ERROS, erro_id)
@@ -924,7 +1120,9 @@ def captar_emails(limit=200, execution_id=None, started_at=None, manifest=None):
                 'skipped_draft': stats_gerais['skipped_draft'],
                 'skipped_non_aso': stats_gerais['skipped_non_aso'],
             }
-        
+            if last_error:
+                manifest['last_error'] = last_error
+
         manifest_path = None
         if manifest is not None:
             manifest_path = salvar_manifest(manifest, PASTA_RELATORIOS, execution_id=execution_id)
@@ -962,6 +1160,17 @@ def captar_emails(limit=200, execution_id=None, started_at=None, manifest=None):
         else:
             registrar_log("Nada processado, email de resumo nao enviado.")
         
+        stats_gerais['finished_at'] = datetime.now().isoformat()
+        stats_gerais['run_status'] = run_status
+        if last_error:
+            stats_gerais['last_error'] = last_error
+        salvar_diagnostico_resumo(
+            stats_gerais,
+            manifest_path=manifest_path,
+            report_paths=report_paths if 'report_paths' in locals() else None,
+            extra={"logs_dir": PASTA_LOGS}
+        )
+
         registrar_log(f"Mensagens verificadas hoje: {encontrados_hoje}; mensagens processadas: {processados}")
         
         

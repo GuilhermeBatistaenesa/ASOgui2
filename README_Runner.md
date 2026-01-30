@@ -1,24 +1,48 @@
 # ASOgui Runner/Updater
 
-## Build (ASOgui onedir + tools + browsers ZIP)
-Use the script:
-```
+## Objetivo
+O Runner instala, atualiza e executa o ASOgui em modo onedir (pasta completa). Ele suporta canal de rede (preferencial) e fallback via GitHub.
+
+---
+
+## Build (ASOgui onedir + tools + browsers + ZIP)
+Script recomendado (gera ZIP de release, SHA256 e latest.json):
+```bash
 powershell -ExecutionPolicy Bypass -File scripts\build_aso_zip.ps1
 ```
 
-## Build (legacy onedir without zip)
-Use the script:
+### Auto-bump de versao
+Se `-Version` nao for informado, o script incrementa automaticamente (patch):
+- `-Bump patch` (padrao)
+- `-Bump minor`
+- `-Bump major`
+- `-Version 1.2.3` (manual)
+
+Atalho sem terminal:
+```bat
+build_zip.bat
+build_zip.bat minor
+build_zip.bat 1.2.3
 ```
+
+---
+
+## Build (legacy onedir sem ZIP)
+```bash
 powershell -ExecutionPolicy Bypass -File scripts\build_windows.ps1
 ```
 
-PyInstaller (runner):
-```
+---
+
+## Runner (PyInstaller)
+```bash
 pyinstaller --onefile --noconsole --name ASOguiRunner runner.py
 ```
 
-## Configure
-Edit `config.json` and set:
+---
+
+## Configuracao do Runner (`config.json`)
+Edite:
 - `network_release_dir` / `network_latest_json`
 - `github_repo`
 - `install_dir`
@@ -26,35 +50,12 @@ Edit `config.json` and set:
 - `allow_prerelease`
 - `run_args`
 
-## Offline run
-The ASOgui package is self-contained (tools + browsers inside).
+---
 
-## Run manually
-```
-ASOguiRunner.exe
-```
-or (with Python):
-```
-python runner.py
-```
-
-## Final package structure
-```
-dist\ASOgui\
-  ASOgui.exe
-  _internal\
-  VERSION.txt
-  .env
-  tools\
-    tesseract\tesseract.exe
-    poppler\bin\pdftoppm.exe
-  playwright-browsers\
-```
-
-## ZIP release package
-The network channel can point to a ZIP containing the full onedir package.
-Example `latest.json`:
-```
+## Canal de rede (ZIP)
+O Runner procura o `latest.json` na pasta de rede e baixa o ZIP completo.
+Exemplo de `latest.json`:
+```json
 {
   "version": "1.0.0",
   "package_filename": "ASOgui_1.0.0.zip",
@@ -62,31 +63,61 @@ Example `latest.json`:
 }
 ```
 
-Generate SHA256:
-```
-Get-FileHash dist\ASOgui_1.0.0.zip -Algorithm SHA256 | ForEach-Object { $_.Hash + "  ASOgui_1.0.0.zip" } > dist\ASOgui_1.0.0.sha256
-```
+---
 
-Note: ASOgui is installed as an ONEDIR package (entire folder).
-
-Install layout:
+## Estrutura final instalada
 ```
 C:\ASOgui\
   app\
-    current\   <-- full onedir package here
+    current\
+      ASOgui.exe
+      _internal\
+      VERSION.txt
+      .env
+      tools\
+        tesseract\...
+        poppler\bin\...
+      playwright-browsers\...
 ```
 
-## Update tools
-Place vendors before build:
+---
+
+## Pasta de downloads (Tesseract/Poppler)
+Alguns usuarios nao tem Tesseract/Poppler instalados. Para facilitar, coloque os ZIPs aqui:
+```
+tools_downloads\
+  tesseract.zip
+  poppler.zip
+```
+
+> Observacao: esses ZIPs sao apenas para distribuicao manual. O build oficial usa `vendor\` e embute as ferramentas no pacote.
+
+---
+
+## Update tools (vendor)
+Antes do build, garantir:
 ```
 vendor\tesseract\tesseract.exe
+vendor\tesseract\tessdata\...
 vendor\poppler\bin\...
 ```
-Then rerun `scripts\build_aso_zip.ps1` (or `scripts\build_windows.ps1`).
 
-## Schedule (Task Scheduler)
-1) Open Task Scheduler
+Ou:
+```
+vendor\tesseract\Tesseract-OCR\tesseract.exe
+```
+
+---
+
+## Execucao
+- Runner instalado: `ASOguiRunner.exe`
+- Python local: `python runner.py`
+
+---
+
+## Agendamento (Task Scheduler)
+1) Abrir Task Scheduler
 2) Create Task
 3) Action: Start a program
 4) Program/script: `C:\ASOgui\ASOguiRunner.exe`
-5) Set triggers as desired (daily/hourly)
+5) Definir gatilhos (diario/horario)

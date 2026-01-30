@@ -57,6 +57,17 @@ class ReportGenerator:
         else:
             md_content += "Nenhum erro registrado.\n"
 
+        md_content += "\n## Falhas OCR (nao salvos)\n"
+        ocr_items = stats.get("ocr_failures", [])
+        if ocr_items:
+            for item in ocr_items:
+                arquivo = mask_cpf_in_text(item.get("arquivo", "Desconhecido"))
+                cpf = mask_cpf_in_text(item.get("cpf", ""))
+                nome = mask_cpf_in_text(item.get("nome", "Desconhecido"))
+                md_content += f"- **{arquivo}**: nome={nome}, cpf={cpf}\n"
+        else:
+            md_content += "Nenhuma falha de OCR registrada.\n"
+
         md_content += "\n## Itens Skipped\n"
         skipped_items = stats.get("skipped_items", [])
         if skipped_items:
