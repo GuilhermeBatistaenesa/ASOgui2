@@ -31,3 +31,14 @@ Thumbs.db
 
 # Release folders (assuming these are artifacts)
 Release-*/
+
+# Build/packaging artifacts
+build/
+dist/
+*.spec
+*.zip
+*.exe
+*.sha256
+.playwright-browsers/
+vendor/
+config.json.bak

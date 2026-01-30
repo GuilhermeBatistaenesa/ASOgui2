@@ -1,18 +1,32 @@
 import win32com.client as win32
+import pywintypes
+import pythoncom
 import os
 import re
 import shutil
 import uuid
 import json
 from dotenv import load_dotenv
+import sys
 
-# Carrega variáveis de ambiente do arquivo .env (se existir)
-load_dotenv()
+# Carrega variaveis de ambiente do arquivo .env (se existir)
+_env_candidates = []
+if getattr(sys, "frozen", False):
+    _env_candidates.append(os.path.join(os.path.dirname(sys.executable), ".env"))
+_env_candidates.append(os.path.join(os.getcwd(), ".env"))
+_env_candidates.append(os.path.join(os.path.dirname(__file__), ".env"))
+for _env_path in _env_candidates:
+    if _env_path and os.path.exists(_env_path):
+        load_dotenv(_env_path)
+        break
+else:
+    load_dotenv()
 import pytesseract
 from pdf2image import convert_from_path
 from datetime import datetime, timedelta
 import traceback
 import hashlib
+import time
 from rpa_yube import run_from_main
 
 # Módulos customizados
@@ -26,7 +40,7 @@ from outcomes import (
     SKIPPED_DRAFT,
     SKIPPED_NON_ASO,
 )
-from utils_masking import mask_cpf, mask_cpf_in_text
+from utils_masking import mask_cpf, mask_cpf_in_text, mask_pii_in_obj
 from idempotency import should_skip_duplicate
 
 # ----------------------------
@@ -508,313 +522,454 @@ def salvar_paginas_individualmente(pdf_path, pasta_destino, numero_obra, lista_n
 # ====================================================================
 # CAPTA EMAIL E PROCESSA ANEXOS
 # ====================================================================
+
+
+def salvar_manifest(manifest, report_dir, filepath=None, execution_id=None):
+    os.makedirs(report_dir, exist_ok=True)
+    if not filepath:
+        if execution_id:
+            filename = f"manifest_{execution_id}.json"
+        else:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"manifest_{ts}.json"
+        filepath = os.path.join(report_dir, filename)
+    safe_manifest = mask_pii_in_obj(manifest)
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(safe_manifest, f, indent=2, ensure_ascii=False)
+    return filepath
+
+
+
+RPC_E_CALL_REJECTED = -2147418111
+_OUTLOOK_PREV_FILTER = None
+_OUTLOOK_COM_INIT = False
+
+
+try:
+    _IID_IOleMessageFilter = pythoncom.IID_IOleMessageFilter
+except AttributeError:
+    try:
+        _IID_IOleMessageFilter = pywintypes.IID("{00000016-0000-0000-C000-000000000046}")
+    except Exception:
+        _IID_IOleMessageFilter = None
+
+
+class MessageFilter:
+    _com_interfaces_ = [_IID_IOleMessageFilter]
+    _public_methods_ = ["HandleInComingCall", "RetryRejectedCall", "MessagePending"]
+
+    def __init__(self, max_wait_sec=60):
+        self._start = time.time()
+        self._max_wait = max_wait_sec
+        self._delays = [250, 500, 1000, 2000]
+        self._idx = 0
+
+    def HandleInComingCall(self, callType, taskCaller, tickCount, interfaceInfo):
+        return 0  # SERVERCALL_ISHANDLED
+
+    def RetryRejectedCall(self, taskCaller, rejectType, tickCount):
+        try:
+            retry_later = pythoncom.SERVERCALL_RETRYLATER
+        except Exception:
+            retry_later = 2
+        elapsed = time.time() - self._start
+        if elapsed >= self._max_wait:
+            return -1  # CANCELCALL
+        if rejectType == retry_later:
+            delay = self._delays[self._idx % len(self._delays)]
+            self._idx += 1
+            return delay
+        return -1
+
+    def MessagePending(self, taskCaller, tickCount, pendingType):
+        return 2  # PENDINGMSG_WAITDEFPROCESS
+
+
+def _register_message_filter(timeout_sec):
+    global _OUTLOOK_PREV_FILTER
+    if not hasattr(pythoncom, "CoRegisterMessageFilter"):
+        return False
+    if _IID_IOleMessageFilter is None:
+        return False
+    filt = MessageFilter(max_wait_sec=timeout_sec)
+    _OUTLOOK_PREV_FILTER = pythoncom.CoRegisterMessageFilter(filt)
+    return True
+
+
+def _unregister_message_filter():
+    global _OUTLOOK_PREV_FILTER
+    if not hasattr(pythoncom, "CoRegisterMessageFilter"):
+        _OUTLOOK_PREV_FILTER = None
+        return
+    try:
+        pythoncom.CoRegisterMessageFilter(_OUTLOOK_PREV_FILTER)
+    finally:
+        _OUTLOOK_PREV_FILTER = None
+
+
+def cleanup_outlook_com():
+    global _OUTLOOK_COM_INIT
+    try:
+        _unregister_message_filter()
+    except Exception:
+        pass
+    if _OUTLOOK_COM_INIT:
+        try:
+            pythoncom.CoUninitialize()
+        except Exception:
+            pass
+        _OUTLOOK_COM_INIT = False
+
+
+def get_outlook_namespace_robusto(timeout_sec=60):
+    global _OUTLOOK_COM_INIT
+    pythoncom.CoInitialize()
+    _OUTLOOK_COM_INIT = True
+    filter_enabled = _register_message_filter(timeout_sec)
+
+    try:
+        try:
+            app = win32.GetActiveObject("Outlook.Application")
+        except Exception:
+            app = win32.DispatchEx("Outlook.Application")
+
+        ns = app.GetNamespace("MAPI")
+        try:
+            ns.Logon("", "", False, False)
+        except Exception:
+            pass
+
+        start = time.time()
+        attempt = 0
+        while True:
+            try:
+                _ = ns.Folders.Count
+                registrar_log("Outlook disponivel.")
+                return app, ns
+            except pywintypes.com_error as e:
+                hr = e.args[0] if e.args else None
+                elapsed = int(time.time() - start)
+                if hr == RPC_E_CALL_REJECTED:
+                    attempt += 1
+                    registrar_log(f"Aguardando Outlook ficar disponivel... tentativa {attempt} ({elapsed}s)")
+                    if elapsed >= timeout_sec:
+                        raise RuntimeError("Outlook ocupado ou com prompt aberto")
+                    time.sleep(1)
+                    continue
+                raise
+    except Exception:
+        raise
+
 def captar_emails(limit=200, execution_id=None, started_at=None, manifest=None):
-    registrar_log("Iniciando leitura do Outlook...")
-    anexos_processados = set()
+    def _capta_core():
+        registrar_log("Iniciando leitura do Outlook...")
+        anexos_processados = set()
 
-
-
-    try:
-        outlook = win32.Dispatch("Outlook.Application").GetNamespace("MAPI")
-
-        conta_destino = None
-
-        # Tentativa 1: localizar pela conta do Outlook
-        for acc in outlook.Accounts:
-            try:
-                if acc.DisplayName.lower() == EMAIL_DESEJADO.lower():
-                    conta_destino = acc
-                    break
-            except:
-                pass
-
-        # Tentativa 2: abrir mailbox direto pelo email
-        if not conta_destino:
-            try:
-                conta_destino = outlook.Folders(EMAIL_DESEJADO)
-            except:
-                conta_destino = None
-
-        # Tentativa 3: abrir mailbox pelo nome visível
-        if not conta_destino and MAILBOX_NAME:
-            try:
-                conta_destino = outlook.Folders(MAILBOX_NAME)
-            except:
-                conta_destino = None
-
-        # Se falhar tudo
-        if not conta_destino:
-            registrar_log(f"Mailbox não encontrada: {EMAIL_DESEJADO} / {MAILBOX_NAME}")
-            return
-
-
-        registrar_log(f"Usando mailbox: {getattr(conta_destino, 'Name', 'Desconhecida')}")
-
-    except Exception as e:
-        registrar_log(f"Erro ao conectar no Outlook: {e}")
-        return
-
-    try:
-        # Caixa de entrada da conta selecionada
         try:
-            inbox = conta_destino.Folders("Caixa de Entrada")
-        except:
-            inbox = conta_destino.Folders("Inbox")
+            app, outlook = get_outlook_namespace_robusto()
 
-        mensagens = inbox.Items
-        mensagens.Sort("ReceivedTime", True)
+            conta_destino = None
 
-    except Exception as e:
-        registrar_log(f"Erro ao acessar caixa de entrada: {e}")
-        return
-
-
-
-    processados = 0
-    encontrados_hoje = 0
-
-    inicio_hoje = datetime.now().replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
-    inicio_amanha = inicio_hoje + timedelta(days=1)
-    # Padrão: busca apenas emails de hoje (pode ser configurado via ASO_DAYS_BACK)
-    days_back_env = os.getenv("ASO_DAYS_BACK")
-    if days_back_env is None or days_back_env == "":
-        days_back = 0  # Padrão: apenas hoje
-    else:
-        try:
-            days_back = int(days_back_env)
-            if days_back < 0:
-                days_back = 0  # Se for negativo, usa 0 (apenas hoje)
-        except ValueError:
-            days_back = 0  # Se não for número válido, usa 0 (apenas hoje)
-    
-    inicio_janela = inicio_hoje - timedelta(days=days_back)
-    
-    if days_back == 0:
-        registrar_log(f"Janela de busca: apenas hoje ({inicio_hoje.date()})")
-    else:
-        registrar_log(f"Janela de busca: últimos {days_back} dias (de {inicio_janela.date()} até {inicio_amanha.date()})")
-        if days_back_env:
-            registrar_log(f"  (Configurado via ASO_DAYS_BACK={days_back_env})")
-    
-    # ESTATISTICAS GERAIS ACUMULADAS
-    stats_gerais = {
-        'execution_id': execution_id,
-        'started_at': started_at.isoformat() if started_at else None,
-        'total_detected': 0,
-        'total_processed': 0,
-        'success': 0,
-        'error': 0,
-        'skipped_duplicate': 0,
-        'skipped_draft': 0,
-        'skipped_non_aso': 0,
-        'sucessos': [],
-        'erros': [],
-        'skipped_items': [],
-        'tempo_total': ''
-    }
-    start_time_total = datetime.now()
-
-    # Collect indices to iterate in reverse, to avoid issues with deleting items if that were ever implemented
-    # For now, it just ensures consistent iteration order if new items arrive during processing
-    indices = list(range(1, min(limit, mensagens.Count) + 1))
-    
-    registrar_log(f"Total de mensagens na caixa de entrada: {mensagens.Count}")
-    
-    for i in reversed(indices): # Changed from `for i in range(1, ...)` to `for i in reversed(indices)`
-        try:
-            msg = mensagens.Item(i)
-
-            # Apenas emails
-            if getattr(msg, "Class", None) != 43:
-                continue
-
-            recebido = msg.ReceivedTime.replace(tzinfo=None)
-            assunto = msg.Subject or ""
-
-            if not (inicio_janela <= recebido < inicio_amanha):
-                continue
-
-            if recebido.date() == inicio_hoje.date():
-                encontrados_hoje += 1
-
-            # Padrão mais flexível: aceita variações no formato
-            m = re.search(
-                r"ASO\s+ADMISSIONAL\s*-\s*([A-Za-z0-9]+)\s*-\s*([0-3]?\d/[0-1]?\d/\d{2,4})(?:\s*-\s*.*)?",
-                assunto,
-                re.IGNORECASE
-            )
-
-            if not m:
-                continue
-
-            numero_obra = m.group(1)
-            registrar_log(f"✓ Email compatível encontrado - Obra: {numero_obra} | Assunto: {assunto[:60]}...")
-
-            anexos_pdf = []
-            total_attachments = msg.Attachments.Count
-            for ai in range(1, total_attachments + 1):
-                att = msg.Attachments.Item(ai)
-                if att.FileName.lower().endswith(".pdf"):
-                    anexos_pdf.append(att)
-
-            if not anexos_pdf:
-                registrar_log(f"  ⚠ Nenhum anexo PDF encontrado neste email")
-                continue
-
-            pasta_obra = os.path.join(PASTA_BASE, f"Obra_{numero_obra}")
-            os.makedirs(pasta_obra, exist_ok=True)
-
-            data_atual = datetime.now().strftime("%Y-%m-%d")
-            pasta_data = os.path.join(pasta_obra, data_atual)
-            os.makedirs(pasta_data, exist_ok=True)
-
-            # LISTA DE ARQUIVOS GERADOS NESTA EXECUÇÃO PARA O RPA
-            arquivos_para_rpa = []
-
-            registrar_log(f"Pasta destino: {pasta_data}")
-
-            for idx, anexo in enumerate(anexos_pdf, start=1):
+            # Tentativa 1: localizar pela conta do Outlook
+            for acc in outlook.Accounts:
                 try:
-                    temp_pdf = os.path.join(pasta_data, f"temp_{idx}.pdf")
-                    anexo.SaveAsFile(temp_pdf)
+                    if acc.DisplayName.lower() == EMAIL_DESEJADO.lower():
+                        conta_destino = acc
+                        break
+                except:
+                    pass
 
-                    hash_atual = calcular_hash_arquivo(temp_pdf)
-                    if hash_atual in anexos_processados:
-                        os.remove(temp_pdf)
-                        continue
-
-                    anexos_processados.add(hash_atual)
-
-                    # Passamos a lista para coletar os novos arquivos
-                    salvar_paginas_individualmente(temp_pdf, pasta_data, numero_obra, lista_novos_arquivos=arquivos_para_rpa, stats=stats_gerais, manifest_items=(manifest.get("items") if manifest else None))
-
-                    os.remove(temp_pdf)
-
-                except Exception as e:
-                    registrar_log(f"Erro ao processar anexo {idx}: {e}")
-                    stats_gerais['erros'].append({'arquivo': f"AnexoEmail_{idx}", 'erro': f"Erro extração PDF: {e}"})
-            
-            # ==================================================
-            # CHAMAR RPA YUBE PARA A PASTA GERADA (APENAS NOVOS)
-            # ==================================================
-            if arquivos_para_rpa:
+            # Tentativa 2: abrir mailbox direto pelo email
+            if not conta_destino:
                 try:
-                    registrar_log(f"Iniciando RPA Yube para {len(arquivos_para_rpa)} arquivos novos...")
-                    # Passamos a lista explícita para evitar processar lixo antigo
-                    # E capturamos as estatísticas de retorno
-                    stats_rpa = run_from_main(pasta_data, files_to_process=arquivos_para_rpa)
-                    
-                    if stats_rpa:
-                        # ACUMULA RESULTADOS
-                        stats_gerais['sucessos'].extend([mask_cpf_in_text(s) for s in stats_rpa.get('sucessos', [])])
-                        stats_gerais['erros'].extend([{"arquivo": mask_cpf_in_text(e.get('arquivo', 'Desconhecido')), "erro": e.get('erro', '')} for e in stats_rpa.get('erros', [])])
-                        stats_gerais['success'] += len(stats_rpa.get('sucessos', []))
-                        stats_gerais['error'] += len(stats_rpa.get('erros', []))
-                        stats_gerais['total_processed'] = stats_gerais['success'] + stats_gerais['error']
-                        if manifest and manifest.get('items') is not None:
-                            for fname in stats_rpa.get('sucessos', []):
-                                manifest['items'].append({
-                                    'file_display': mask_cpf_in_text(fname),
-                                    'cpf_masked': mask_cpf(fname),
-                                    'outcome': SUCCESS,
-                                    'message': 'RPA sucesso'
-                                })
-                            for err in stats_rpa.get('erros', []):
-                                manifest['items'].append({
-                                    'file_display': mask_cpf_in_text(err.get('arquivo', 'Desconhecido')),
-                                    'cpf_masked': mask_cpf(err.get('arquivo', '')),
-                                    'outcome': ERROR,
-                                    'message': err.get('erro', '')
-                                })
+                    conta_destino = outlook.Folders(EMAIL_DESEJADO)
+                except:
+                    conta_destino = None
 
-                except Exception as e:
-                    registrar_log(f"Erro ao executar RPA Yube: {e}")
-                    stats_gerais['erros'].append({'arquivo': 'RPA_CRASH', 'erro': str(e)})
-                    stats_gerais['error'] += 1
-            else:
-                registrar_log("Nenhum arquivo novo para processar no RPA.")
+            # Tentativa 3: abrir mailbox pelo nome visivel
+            if not conta_destino and MAILBOX_NAME:
+                try:
+                    conta_destino = outlook.Folders(MAILBOX_NAME)
+                except:
+                    conta_destino = None
 
-            processados += 1
+            # Se falhar tudo
+            if not conta_destino:
+                registrar_log(f"Mailbox nao encontrada: {EMAIL_DESEJADO} / {MAILBOX_NAME}")
+                return
+
+            registrar_log(f"Usando mailbox: {getattr(conta_destino, 'Name', 'Desconhecida')}")
 
         except Exception as e:
-            registrar_log(f"Erro inesperado: {e}")
+            registrar_log(f"Erro ao conectar no Outlook: {e}")
+            registrar_log("Verifique se o Outlook esta aberto e sem prompts. Sugestao: fechar e abrir manualmente, testar outlook /safe.")
+            return
+
+        try:
+            # Caixa de entrada da conta selecionada
             try:
-                erro_id = f"erro_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-                pasta_erro = os.path.join(PASTA_ERROS, erro_id)
-                os.makedirs(pasta_erro, exist_ok=True)
-                with open(os.path.join(pasta_erro, "erro.txt"), "w", encoding="utf-8") as f:
-                    f.write(traceback.format_exc())
+                inbox = conta_destino.Folders("Caixa de Entrada")
             except:
-                pass
-            continue
-
-    # ==================================================
-    # ENVIO DO RESUMO CONSOLIDADO
-    # ==================================================
-    elapsed_total = datetime.now() - start_time_total
-    run_status = "INCONSISTENT" if stats_gerais['error'] > 0 else "CONSISTENT"
-    stats_gerais['tempo_total'] = str(timedelta(seconds=int(elapsed_total.total_seconds())))
-
-    stats_gerais['total_processed'] = stats_gerais['success'] + stats_gerais['error']
-    stats_gerais['total'] = stats_gerais['total_processed']
-    stats_gerais['run_status'] = run_status
-    if manifest is not None:
-        manifest['finished_at'] = datetime.now().isoformat()
-        manifest['duration_sec'] = int(elapsed_total.total_seconds())
-        manifest['run_status'] = run_status
-        manifest['totals'] = {
-            'total_detected': stats_gerais['total_detected'],
-            'total_processed': stats_gerais['total_processed'],
-            'success': stats_gerais['success'],
-            'error': stats_gerais['error'],
-            'skipped_duplicate': stats_gerais['skipped_duplicate'],
-            'skipped_draft': stats_gerais['skipped_draft'],
-            'skipped_non_aso': stats_gerais['skipped_non_aso'],
-        }
-
-    manifest_path = None
-    if manifest is not None:
-        manifest_path = salvar_manifest(manifest, PASTA_RELATORIOS, execution_id=execution_id)
-        if manifest_path:
-            manifest['paths']['manifest'] = manifest_path
-
-    # So envia email se houver algo processado (sucesso ou erro)
-    if stats_gerais['total_detected'] > 0 or stats_gerais['error'] > 0:
-        registrar_log("Gerando relatorio e enviando email...")
+                inbox = conta_destino.Folders("Inbox")
         
-        # 1. Salvar Relatorio JSON/MD
-        report_paths = reporter.save_report(stats_gerais)
-        if manifest is not None:
-            manifest['paths'].update({
-                'report_json': report_paths.get('json') if report_paths else None,
-                'report_md': report_paths.get('md') if report_paths else None,
-                'logs': PASTA_LOGS,
-            })
+            mensagens = inbox.Items
+            mensagens.Sort("ReceivedTime", True)
         
-        # 2. Enviar Email
-        email_status, email_error = enviar_resumo_email(
-            TARGET_ACCOUNT,
-            stats_gerais,
-            execution_id,
-            run_status,
-            report_paths=report_paths,
-            manifest_path=manifest_path,
-            logger=logger,
+        except Exception as e:
+            registrar_log(f"Erro ao acessar caixa de entrada: {e}")
+            return
+        
+        
+        
+        processados = 0
+        encontrados_hoje = 0
+        
+        inicio_hoje = datetime.now().replace(
+            hour=0, minute=0, second=0, microsecond=0
         )
+        inicio_amanha = inicio_hoje + timedelta(days=1)
+        # Padrão: busca apenas emails de hoje (pode ser configurado via ASO_DAYS_BACK)
+        days_back_env = os.getenv("ASO_DAYS_BACK")
+        if days_back_env is None or days_back_env == "":
+            days_back = 0  # Padrão: apenas hoje
+        else:
+            try:
+                days_back = int(days_back_env)
+                if days_back < 0:
+                    days_back = 0  # Se for negativo, usa 0 (apenas hoje)
+            except ValueError:
+                days_back = 0  # Se não for número válido, usa 0 (apenas hoje)
+        
+        inicio_janela = inicio_hoje - timedelta(days=days_back)
+        
+        if days_back == 0:
+            registrar_log(f"Janela de busca: apenas hoje ({inicio_hoje.date()})")
+        else:
+            registrar_log(f"Janela de busca: últimos {days_back} dias (de {inicio_janela.date()} até {inicio_amanha.date()})")
+            if days_back_env:
+                registrar_log(f"  (Configurado via ASO_DAYS_BACK={days_back_env})")
+        
+        # ESTATISTICAS GERAIS ACUMULADAS
+        stats_gerais = {
+            'execution_id': execution_id,
+            'started_at': started_at.isoformat() if started_at else None,
+            'total_detected': 0,
+            'total_processed': 0,
+            'success': 0,
+            'error': 0,
+            'skipped_duplicate': 0,
+            'skipped_draft': 0,
+            'skipped_non_aso': 0,
+            'sucessos': [],
+            'erros': [],
+            'skipped_items': [],
+            'tempo_total': ''
+        }
+        start_time_total = datetime.now()
+        
+        # Collect indices to iterate in reverse, to avoid issues with deleting items if that were ever implemented
+        # For now, it just ensures consistent iteration order if new items arrive during processing
+        indices = list(range(1, min(limit, mensagens.Count) + 1))
+        
+        registrar_log(f"Total de mensagens na caixa de entrada: {mensagens.Count}")
+        
+        for i in reversed(indices): # Changed from `for i in range(1, ...)` to `for i in reversed(indices)`
+            try:
+                msg = mensagens.Item(i)
+        
+                # Apenas emails
+                if getattr(msg, "Class", None) != 43:
+                    continue
+        
+                recebido = msg.ReceivedTime.replace(tzinfo=None)
+                assunto = msg.Subject or ""
+        
+                if not (inicio_janela <= recebido < inicio_amanha):
+                    continue
+        
+                if recebido.date() == inicio_hoje.date():
+                    encontrados_hoje += 1
+        
+                # Padrão mais flexível: aceita variações no formato
+                m = re.search(
+                    r"ASO\s+ADMISSIONAL\s*-\s*([A-Za-z0-9]+)\s*-\s*([0-3]?\d/[0-1]?\d/\d{2,4})(?:\s*-\s*.*)?",
+                    assunto,
+                    re.IGNORECASE
+                )
+        
+                if not m:
+                    continue
+        
+                numero_obra = m.group(1)
+                registrar_log(f"✓ Email compatível encontrado - Obra: {numero_obra} | Assunto: {assunto[:60]}...")
+        
+                anexos_pdf = []
+                total_attachments = msg.Attachments.Count
+                for ai in range(1, total_attachments + 1):
+                    att = msg.Attachments.Item(ai)
+                    if att.FileName.lower().endswith(".pdf"):
+                        anexos_pdf.append(att)
+        
+                if not anexos_pdf:
+                    registrar_log(f"  ⚠ Nenhum anexo PDF encontrado neste email")
+                    continue
+        
+                pasta_obra = os.path.join(PASTA_BASE, f"Obra_{numero_obra}")
+                os.makedirs(pasta_obra, exist_ok=True)
+        
+                data_atual = datetime.now().strftime("%Y-%m-%d")
+                pasta_data = os.path.join(pasta_obra, data_atual)
+                os.makedirs(pasta_data, exist_ok=True)
+        
+                # LISTA DE ARQUIVOS GERADOS NESTA EXECUÇÃO PARA O RPA
+                arquivos_para_rpa = []
+        
+                registrar_log(f"Pasta destino: {pasta_data}")
+        
+                for idx, anexo in enumerate(anexos_pdf, start=1):
+                    try:
+                        temp_pdf = os.path.join(pasta_data, f"temp_{idx}.pdf")
+                        anexo.SaveAsFile(temp_pdf)
+        
+                        hash_atual = calcular_hash_arquivo(temp_pdf)
+                        if hash_atual in anexos_processados:
+                            os.remove(temp_pdf)
+                            continue
+        
+                        anexos_processados.add(hash_atual)
+        
+                        # Passamos a lista para coletar os novos arquivos
+                        salvar_paginas_individualmente(temp_pdf, pasta_data, numero_obra, lista_novos_arquivos=arquivos_para_rpa, stats=stats_gerais, manifest_items=(manifest.get("items") if manifest else None))
+        
+                        os.remove(temp_pdf)
+        
+                    except Exception as e:
+                        registrar_log(f"Erro ao processar anexo {idx}: {e}")
+                        stats_gerais['erros'].append({'arquivo': f"AnexoEmail_{idx}", 'erro': f"Erro extração PDF: {e}"})
+        
+                # ==================================================
+                # CHAMAR RPA YUBE PARA A PASTA GERADA (APENAS NOVOS)
+                # ==================================================
+                if arquivos_para_rpa:
+                    try:
+                        registrar_log(f"Iniciando RPA Yube para {len(arquivos_para_rpa)} arquivos novos...")
+                        # Passamos a lista explícita para evitar processar lixo antigo
+                        # E capturamos as estatísticas de retorno
+                        stats_rpa = run_from_main(pasta_data, files_to_process=arquivos_para_rpa)
+        
+                        if stats_rpa:
+                            # ACUMULA RESULTADOS
+                            stats_gerais['sucessos'].extend([mask_cpf_in_text(s) for s in stats_rpa.get('sucessos', [])])
+                            stats_gerais['erros'].extend([{"arquivo": mask_cpf_in_text(e.get('arquivo', 'Desconhecido')), "erro": e.get('erro', '')} for e in stats_rpa.get('erros', [])])
+                            stats_gerais['success'] += len(stats_rpa.get('sucessos', []))
+                            stats_gerais['error'] += len(stats_rpa.get('erros', []))
+                            stats_gerais['total_processed'] = stats_gerais['success'] + stats_gerais['error']
+                            if manifest and manifest.get('items') is not None:
+                                for fname in stats_rpa.get('sucessos', []):
+                                    manifest['items'].append({
+                                        'file_display': mask_cpf_in_text(fname),
+                                        'cpf_masked': mask_cpf(fname),
+                                        'outcome': SUCCESS,
+                                        'message': 'RPA sucesso'
+                                    })
+                                for err in stats_rpa.get('erros', []):
+                                    manifest['items'].append({
+                                        'file_display': mask_cpf_in_text(err.get('arquivo', 'Desconhecido')),
+                                        'cpf_masked': mask_cpf(err.get('arquivo', '')),
+                                        'outcome': ERROR,
+                                        'message': err.get('erro', '')
+                                    })
+        
+                    except Exception as e:
+                        registrar_log(f"Erro ao executar RPA Yube: {e}")
+                        stats_gerais['erros'].append({'arquivo': 'RPA_CRASH', 'erro': str(e)})
+                        stats_gerais['error'] += 1
+                else:
+                    registrar_log("Nenhum arquivo novo para processar no RPA.")
+        
+                processados += 1
+        
+            except Exception as e:
+                registrar_log(f"Erro inesperado: {e}")
+                try:
+                    erro_id = f"erro_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                    pasta_erro = os.path.join(PASTA_ERROS, erro_id)
+                    os.makedirs(pasta_erro, exist_ok=True)
+                    with open(os.path.join(pasta_erro, "erro.txt"), "w", encoding="utf-8") as f:
+                        f.write(traceback.format_exc())
+                except:
+                    pass
+                continue
+        
+        # ==================================================
+        # ENVIO DO RESUMO CONSOLIDADO
+        # ==================================================
+        elapsed_total = datetime.now() - start_time_total
+        run_status = "INCONSISTENT" if stats_gerais['error'] > 0 else "CONSISTENT"
+        stats_gerais['tempo_total'] = str(timedelta(seconds=int(elapsed_total.total_seconds())))
+        
+        stats_gerais['total_processed'] = stats_gerais['success'] + stats_gerais['error']
+        stats_gerais['total'] = stats_gerais['total_processed']
+        stats_gerais['run_status'] = run_status
         if manifest is not None:
-            manifest['email_status'] = email_status
-            manifest['email_error'] = email_error
+            manifest['finished_at'] = datetime.now().isoformat()
+            manifest['duration_sec'] = int(elapsed_total.total_seconds())
+            manifest['run_status'] = run_status
+            manifest['totals'] = {
+                'total_detected': stats_gerais['total_detected'],
+                'total_processed': stats_gerais['total_processed'],
+                'success': stats_gerais['success'],
+                'error': stats_gerais['error'],
+                'skipped_duplicate': stats_gerais['skipped_duplicate'],
+                'skipped_draft': stats_gerais['skipped_draft'],
+                'skipped_non_aso': stats_gerais['skipped_non_aso'],
+            }
+        
+        manifest_path = None
+        if manifest is not None:
+            manifest_path = salvar_manifest(manifest, PASTA_RELATORIOS, execution_id=execution_id)
             if manifest_path:
-                salvar_manifest(manifest, PASTA_RELATORIOS, filepath=manifest_path, execution_id=execution_id)
-    else:
-        registrar_log("Nada processado, email de resumo nao enviado.")
-
-    registrar_log(f"Mensagens verificadas hoje: {encontrados_hoje}; mensagens processadas: {processados}")
-
-
-
+                manifest['paths']['manifest'] = manifest_path
+        
+        # So envia email se houver algo processado (sucesso ou erro)
+        if stats_gerais['total_detected'] > 0 or stats_gerais['error'] > 0:
+            registrar_log("Gerando relatorio e enviando email...")
+        
+            # 1. Salvar Relatorio JSON/MD
+            report_paths = reporter.save_report(stats_gerais)
+            if manifest is not None:
+                manifest['paths'].update({
+                    'report_json': report_paths.get('json') if report_paths else None,
+                    'report_md': report_paths.get('md') if report_paths else None,
+                    'logs': PASTA_LOGS,
+                })
+        
+            # 2. Enviar Email
+            email_status, email_error = enviar_resumo_email(
+                TARGET_ACCOUNT,
+                stats_gerais,
+                execution_id,
+                run_status,
+                report_paths=report_paths,
+                manifest_path=manifest_path,
+                logger=logger,
+            )
+            if manifest is not None:
+                manifest['email_status'] = email_status
+                manifest['email_error'] = email_error
+                if manifest_path:
+                    salvar_manifest(manifest, PASTA_RELATORIOS, filepath=manifest_path, execution_id=execution_id)
+        else:
+            registrar_log("Nada processado, email de resumo nao enviado.")
+        
+        registrar_log(f"Mensagens verificadas hoje: {encontrados_hoje}; mensagens processadas: {processados}")
+        
+        
+        
+    try:
+        return _capta_core()
+    finally:
+        cleanup_outlook_com()
 # ====================================================================
 # MAIN
 # ====================================================================

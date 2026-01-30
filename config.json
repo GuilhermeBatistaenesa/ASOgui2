@@ -1,8 +1,8 @@
-{
-  "network_release_dir": "P:\\\\ProcessoASO\\\\releases",
-  "network_latest_json": "P:\\\\ProcessoASO\\\\releases\\\\latest.json",
-  "github_repo": "GuilhermeCostaProenca/ASOgui2",
-  "install_dir": "C:\\\\ASOgui",
+﻿{
+  "network_release_dir": "P:\\ProcessoASO\\releases",
+  "network_latest_json": "P:\\ProcessoASO\\releases\\latest.json",
+  "github_repo": "GuilhermeBatistaenesa/ASOgui2",
+  "install_dir": "C:\\ASOgui",
   "prefer_network": true,
   "allow_prerelease": false,
   "run_args": [],

@@ -10,7 +10,23 @@ from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 from utils_masking import mask_cpf, mask_cpf_in_text
 
-load_dotenv()  # opcional: carregar YUBE_USER/YUBE_PASS se quiser
+
+import sys
+
+def _load_env():
+    candidates = []
+    if getattr(sys, "frozen", False):
+        candidates.append(os.path.join(os.path.dirname(sys.executable), ".env"))
+    candidates.append(os.path.join(os.getcwd(), ".env"))
+    candidates.append(os.path.join(os.path.dirname(__file__), ".env"))
+    for p in candidates:
+        if p and os.path.exists(p):
+            load_dotenv(p)
+            return
+    load_dotenv()
+
+_load_env()
+
 
 # ---------- CONFIGURAÇÃO ----------
 YUBE_URL = os.getenv("YUBE_URL", "https://yube.com.br/")
@@ -65,7 +81,7 @@ SEL_ENTRAR = lambda page: page.locator("input[id='kc-login']")
 SEL_CHECKBOX_TODAS = lambda page: page.get_by_role("checkbox", name=re.compile("Selecionar Todas", re.I))
 SEL_BUSCA = lambda page: page.get_by_placeholder(re.compile("Procure por nome, email ou telefone", re.I))
 SEL_VER_PROCESSO = lambda page: page.get_by_text("Ver processo")
-SEL_EXAME_ADM = lambda page: page.get_by_role("button", name=re.compile(r"(Exame.*Admissional|Sa.de.*Ocupacional|ASO)", re.I))
+SEL_EXAME_ADM = lambda page: page.get_by_role("button", name=re.compile(r"(Exame.*Admissional|Saude.*Ocupacional|ASO)", re.I))
 SEL_CRIAR_DOC = lambda page: page.get_by_role("button", name="Criar documento")
 SEL_UPLOAD_BTN = lambda page: page.get_by_role("button", name=re.compile("Tirar foto do resultado", re.I))
 SEL_SALVAR = lambda page: page.get_by_role("button", name="Salvar")
