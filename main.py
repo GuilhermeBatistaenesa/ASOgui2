@@ -377,8 +377,8 @@ def extrair_dados_completos(img, texto_ocr=None, _retry=False):
         if bloco:
             nome = bloco.group(1).strip()
 
-    # Se nome ainda desconhecido, tentar um OCR mais agressivo uma unica vez
-    if nome == "Desconhecido" and not _retry:
+    # Se nome ou CPF ainda desconhecidos, tentar um OCR mais agressivo uma unica vez
+    if (nome == "Desconhecido" or cpf == "CPF_Desconhecido") and not _retry:
         try:
             texto2 = ocr_with_fallback(img, force_full=True)
         except Exception:
