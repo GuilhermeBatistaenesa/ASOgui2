@@ -8,6 +8,10 @@ import uuid
 import json
 from dotenv import load_dotenv
 import sys
+import html as html_lib
+import urllib.request
+import urllib.parse
+import http.cookiejar
 
 # Carrega variaveis de ambiente do arquivo .env (se existir)
 _env_candidates = []
@@ -89,7 +93,39 @@ else:
     # mas o aviso ajuda o usuário a saber o que houve.
 
 # Poppler também pode vir do .env
-POPPLER_PATH = os.getenv("POPPLER_PATH", r"P:\ASO\Release-24.08.0-0\poppler-24.08.0\Library\bin")
+def find_poppler():
+    candidates = []
+    env_path = os.getenv("POPPLER_PATH")
+    if env_path:
+        candidates.append(env_path)
+
+    here = os.path.dirname(__file__)
+    candidates.extend([
+        os.path.join(os.getcwd(), "vendor", "poppler", "bin"),
+        os.path.join(here, "vendor", "poppler", "bin"),
+        os.path.join(here, "Release-24.08.0-0", "poppler-24.08.0", "Library", "bin"),
+        r"C:\Program Files\poppler\bin",
+        r"C:\Program Files\poppler-24.08.0\Library\bin",
+        r"C:\Program Files (x86)\poppler\bin",
+    ])
+
+    for p in candidates:
+        if not p:
+            continue
+        candidate = p
+        if os.path.isfile(candidate) and candidate.lower().endswith("pdftoppm.exe"):
+            candidate = os.path.dirname(candidate)
+        if os.path.isdir(candidate):
+            exe_path = os.path.join(candidate, "pdftoppm.exe")
+            if os.path.exists(exe_path):
+                return candidate
+    return None
+
+POPPLER_PATH = find_poppler()
+if POPPLER_PATH:
+    print(f"DEBUG: Configured Poppler Path: '{POPPLER_PATH}'")
+else:
+    print("AVISO: Poppler (pdftoppm.exe) nao encontrado. Configure POPPLER_PATH no .env")
 
 PASTA_BASE = os.getenv("PROCESSO_ASO_BASE", r"P:\ProcessoASO")
 PASTA_PROCESSADOS = os.path.join(PASTA_BASE, "processados")
@@ -111,6 +147,8 @@ logger = RpaLogger(PASTA_LOGS)
 reporter = ReportGenerator(PASTA_RELATORIOS)
 
 TARGET_ACCOUNT = os.getenv("ASO_EMAIL_ACCOUNT", "aso@enesa.com.br")
+GDRIVE_NAME_FILTER = os.getenv("ASO_GDRIVE_NAME_FILTER", "asos enesa").strip().lower()
+GDRIVE_TIMEOUT_SEC = int(os.getenv("ASO_GDRIVE_TIMEOUT_SEC", "60"))
 
 
 # ====================================================================
@@ -664,6 +702,152 @@ def salvar_manifest(manifest, report_dir, filepath=None, execution_id=None):
     return filepath
 
 
+def _extract_gdrive_file_ids(text):
+    if not text:
+        return []
+    text = html_lib.unescape(text)
+    ids = set()
+    patterns = [
+        r"https?://drive\.google\.com/file/d/([a-zA-Z0-9_-]{10,})",
+        r"https?://drive\.google\.com/open\?id=([a-zA-Z0-9_-]{10,})",
+        r"https?://drive\.google\.com/uc\?[^ \t\r\n\"'>]+?id=([a-zA-Z0-9_-]{10,})",
+    ]
+    for pat in patterns:
+        for m in re.finditer(pat, text, re.IGNORECASE):
+            ids.add(m.group(1))
+    return list(ids)
+
+
+def _parse_filename_from_cd(content_disposition):
+    if not content_disposition:
+        return None
+    m = re.search(r"filename\*=UTF-8''([^;]+)", content_disposition, re.IGNORECASE)
+    if m:
+        return urllib.parse.unquote(m.group(1)).strip()
+    m = re.search(r'filename="?([^";]+)"?', content_disposition, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    return None
+
+
+def _parse_filename_from_html(html_text):
+    if not html_text:
+        return None
+    m = re.search(r"<title>\s*(.*?)\s*- Google Drive\s*</title>", html_text, re.IGNORECASE)
+    if m:
+        return html_lib.unescape(m.group(1)).strip()
+    m = re.search(r'class="uc-name-size"[^>]*>\s*([^<]+)\s*<', html_text, re.IGNORECASE)
+    if m:
+        return html_lib.unescape(m.group(1)).strip()
+    return None
+
+
+def _parse_confirm_token(html_text):
+    if not html_text:
+        return None
+    m = re.search(r"confirm=([0-9A-Za-z_]+)", html_text)
+    if m:
+        return m.group(1)
+    return None
+
+
+def _safe_filename(filename):
+    if not filename:
+        return None
+    filename = os.path.basename(filename)
+    filename = re.sub(r"[\\/:*?\"<>|]+", "_", filename)
+    return filename.strip()
+
+
+def _unique_path(path):
+    if not os.path.exists(path):
+        return path
+    base, ext = os.path.splitext(path)
+    for i in range(1, 1000):
+        candidate = f"{base}_{i}{ext}"
+        if not os.path.exists(candidate):
+            return candidate
+    return f"{base}_{int(time.time())}{ext}"
+
+
+def _gdrive_name_matches(filename):
+    if not GDRIVE_NAME_FILTER:
+        return True
+    return GDRIVE_NAME_FILTER in (filename or "").lower()
+
+
+def _stream_download(resp, dest_dir, filename):
+    safe_name = _safe_filename(filename) or f"gdrive_{int(time.time())}.bin"
+    full_path = _unique_path(os.path.join(dest_dir, safe_name))
+    with open(full_path, "wb") as f:
+        while True:
+            chunk = resp.read(1024 * 1024)
+            if not chunk:
+                break
+            f.write(chunk)
+    try:
+        resp.close()
+    except Exception:
+        pass
+    return full_path
+
+
+def download_gdrive_file(file_id, dest_dir):
+    cookiejar = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cookiejar))
+
+    def _open(url):
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Accept": "*/*",
+            },
+        )
+        return opener.open(req, timeout=GDRIVE_TIMEOUT_SEC)
+
+    base_url = "https://drive.google.com/uc?export=download"
+    url = f"{base_url}&id={urllib.parse.quote(file_id)}"
+
+    resp = _open(url)
+    cd = resp.headers.get("Content-Disposition")
+    filename = _parse_filename_from_cd(cd)
+    if filename:
+        safe_name = _safe_filename(filename)
+        if not _gdrive_name_matches(safe_name):
+            resp.close()
+            return None
+        if not safe_name.lower().endswith(".pdf"):
+            ctype = (resp.headers.get("Content-Type") or "").lower()
+            if "pdf" not in ctype:
+                resp.close()
+                return None
+        return _stream_download(resp, dest_dir, safe_name)
+
+    html_text = resp.read(1024 * 1024).decode("utf-8", errors="ignore")
+    resp.close()
+    filename = _parse_filename_from_html(html_text)
+    confirm = _parse_confirm_token(html_text)
+
+    if not confirm:
+        return None
+
+    url2 = f"{base_url}&confirm={urllib.parse.quote(confirm)}&id={urllib.parse.quote(file_id)}"
+    resp2 = _open(url2)
+    cd2 = resp2.headers.get("Content-Disposition")
+    filename2 = _parse_filename_from_cd(cd2) or filename or f"gdrive_{file_id}.pdf"
+    safe_name2 = _safe_filename(filename2)
+    if not _gdrive_name_matches(safe_name2):
+        resp2.close()
+        return None
+    if not safe_name2.lower().endswith(".pdf"):
+        ctype2 = (resp2.headers.get("Content-Type") or "").lower()
+        if "pdf" not in ctype2:
+            resp2.close()
+            return None
+    return _stream_download(resp2, dest_dir, safe_name2)
+
+
 
 RPC_E_CALL_REJECTED = -2147418111
 _OUTLOOK_PREV_FILTER = None
@@ -995,6 +1179,18 @@ def captar_emails(limit=200, execution_id=None, started_at=None, manifest=None):
         
                 numero_obra = m.group(1)
                 registrar_log(f"Email compativel encontrado - Obra: {numero_obra} | Assunto: {assunto[:60]}...")
+
+                pasta_obra = os.path.join(PASTA_BASE, f"Obra_{numero_obra}")
+                os.makedirs(pasta_obra, exist_ok=True)
+
+                data_atual = datetime.now().strftime("%Y-%m-%d")
+                pasta_data = os.path.join(pasta_obra, data_atual)
+                os.makedirs(pasta_data, exist_ok=True)
+
+                # LISTA DE ARQUIVOS GERADOS NESTA EXECUCAO PARA O RPA
+                arquivos_para_rpa = []
+
+                registrar_log(f"Pasta destino: {pasta_data}")
         
                 anexos_pdf = []
                 total_attachments = msg.Attachments.Count
@@ -1003,44 +1199,89 @@ def captar_emails(limit=200, execution_id=None, started_at=None, manifest=None):
                     if att.FileName.lower().endswith(".pdf"):
                         anexos_pdf.append(att)
         
-                if not anexos_pdf:
-                    registrar_log("  Aviso: Nenhum anexo PDF encontrado neste email")
-                    continue
-        
-                pasta_obra = os.path.join(PASTA_BASE, f"Obra_{numero_obra}")
-                os.makedirs(pasta_obra, exist_ok=True)
-        
-                data_atual = datetime.now().strftime("%Y-%m-%d")
-                pasta_data = os.path.join(pasta_obra, data_atual)
-                os.makedirs(pasta_data, exist_ok=True)
-        
-                # LISTA DE ARQUIVOS GERADOS NESTA EXECUÇÃO PARA O RPA
-                arquivos_para_rpa = []
-        
-                registrar_log(f"Pasta destino: {pasta_data}")
-        
-                for idx, anexo in enumerate(anexos_pdf, start=1):
-                    try:
-                        temp_pdf = os.path.join(pasta_data, f"temp_{idx}.pdf")
-                        anexo.SaveAsFile(temp_pdf)
-        
-                        hash_atual = calcular_hash_arquivo(temp_pdf)
-                        if hash_atual in anexos_processados:
+                if anexos_pdf:
+                    for idx, anexo in enumerate(anexos_pdf, start=1):
+                        try:
+                            temp_pdf = os.path.join(pasta_data, f"temp_{idx}.pdf")
+                            anexo.SaveAsFile(temp_pdf)
+                            
+                            hash_atual = calcular_hash_arquivo(temp_pdf)
+                            if hash_atual in anexos_processados:
+                                os.remove(temp_pdf)
+                                continue
+                            
+                            anexos_processados.add(hash_atual)
+                            
+                            # Passamos a lista para coletar os novos arquivos
+                            salvar_paginas_individualmente(temp_pdf, pasta_data, numero_obra, lista_novos_arquivos=arquivos_para_rpa, stats=stats_gerais, manifest_items=(manifest.get('items') if manifest else None))
+                            
                             os.remove(temp_pdf)
-                            continue
-        
-                        anexos_processados.add(hash_atual)
-        
-                        # Passamos a lista para coletar os novos arquivos
-                        salvar_paginas_individualmente(temp_pdf, pasta_data, numero_obra, lista_novos_arquivos=arquivos_para_rpa, stats=stats_gerais, manifest_items=(manifest.get("items") if manifest else None))
-        
-                        os.remove(temp_pdf)
-        
-                    except Exception as e:
-                        last_error = f"Erro ao processar anexo {idx}: {e}"
-                        registrar_log(last_error)
-                        stats_gerais['erros'].append({'arquivo': f"AnexoEmail_{idx}", 'erro': f"Erro extracao PDF: {e}"})
-        
+                            
+                        except Exception as e:
+                            last_error = f"Erro ao processar anexo {idx}: {e}"
+                            registrar_log(last_error)
+                            stats_gerais['erros'].append({'arquivo': f"AnexoEmail_{idx}", 'erro': f"Erro extracao PDF: {e}"})
+                else:
+                    body_text = ""
+                    try:
+                        body_text = (msg.HTMLBody or "")
+                    except Exception:
+                        body_text = ""
+                    try:
+                        body_text = body_text + "\n" + (msg.Body or "")
+                    except Exception:
+                        pass
+                    
+                    gdrive_ids = _extract_gdrive_file_ids(body_text)
+                    if not gdrive_ids:
+                        registrar_log("  Aviso: Nenhum anexo PDF ou link Google Drive encontrado neste email")
+                        continue
+                    
+                    registrar_log(f"  Nenhum anexo PDF. Links Google Drive encontrados: {len(gdrive_ids)}")
+                    
+                    baixados = []
+                    for gid in gdrive_ids:
+                        try:
+                            caminho = download_gdrive_file(gid, pasta_data)
+                            if not caminho:
+                                registrar_log(f"  Link Google Drive ignorado pelo filtro de nome: {gid}")
+                                continue
+                            if not caminho.lower().endswith('.pdf'):
+                                registrar_log(f"  Link Google Drive ignorado (nao PDF): {os.path.basename(caminho)}")
+                                try:
+                                    os.remove(caminho)
+                                except Exception:
+                                    pass
+                                continue
+                            registrar_log(f"  Baixado Google Drive: {os.path.basename(caminho)}")
+                            baixados.append(caminho)
+                        except Exception as e:
+                            last_error = f"Erro ao baixar Google Drive ({gid}): {e}"
+                            registrar_log(last_error)
+                            stats_gerais['erros'].append({'arquivo': f"GoogleDrive_{gid}", 'erro': f"Erro download: {e}"})
+                            stats_gerais['error'] += 1
+                    
+                    if not baixados:
+                        registrar_log("  Nenhum arquivo valido baixado do Google Drive.")
+                        continue
+                    
+                    for idx, temp_pdf in enumerate(baixados, start=1):
+                        try:
+                            hash_atual = calcular_hash_arquivo(temp_pdf)
+                            if hash_atual in anexos_processados:
+                                os.remove(temp_pdf)
+                                continue
+                            
+                            anexos_processados.add(hash_atual)
+                            
+                            salvar_paginas_individualmente(temp_pdf, pasta_data, numero_obra, lista_novos_arquivos=arquivos_para_rpa, stats=stats_gerais, manifest_items=(manifest.get('items') if manifest else None))
+                            
+                            os.remove(temp_pdf)
+                            
+                        except Exception as e:
+                            last_error = f"Erro ao processar Google Drive {idx}: {e}"
+                            registrar_log(last_error)
+                            stats_gerais['erros'].append({'arquivo': f"GoogleDrive_{idx}", 'erro': f"Erro extracao PDF: {e}"})
                 # ==================================================
                 # CHAMAR RPA YUBE PARA A PASTA GERADA (APENAS NOVOS)
                 # ==================================================
