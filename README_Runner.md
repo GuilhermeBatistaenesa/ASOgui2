@@ -25,12 +25,21 @@ build_zip.bat minor
 build_zip.bat 1.2.3
 ```
 
+### Notas de build
+- O script aceita `PYTHON_EXE` para apontar um `python.exe` especifico.
+- Se `PYTHON_EXE` nao estiver definido, o script tenta Python 3.12+ ou `py -3`.
+- Os browsers do Playwright sao instalados em `%TEMP%` e copiados para o pacote.
+
 ---
 
 ## Build (legacy onedir sem ZIP)
 ```bash
 powershell -ExecutionPolicy Bypass -File scripts\build_windows.ps1
 ```
+
+Notas:
+- Cria `.venv-build` para o build.
+- Instala browsers do Playwright no projeto (`playwright-browsers` ou `.playwright`).
 
 ---
 
@@ -49,6 +58,15 @@ Edite:
 - `prefer_network`
 - `allow_prerelease`
 - `run_args`
+- `log_level`
+- `ui`
+
+---
+
+## Localizacao do config.json
+- Se passar `--config "C:\caminho\config.json"`, usa esse arquivo.
+- Caso contrario, procura `config.json` ao lado do exe/script.
+- Se nao achar, procura no diretorio atual.
 
 ---
 

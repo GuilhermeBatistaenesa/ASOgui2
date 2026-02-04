@@ -1,7 +1,7 @@
 # DOCUMENTACAO TECNICA OFICIAL - ASOgui (RPA ASO)
 
-**Versao do documento**: 2.0
-**Data**: 30/01/2026
+**Versao do documento**: 2.1
+**Data**: 04/02/2026
 **Projeto**: Automacao de Recebimento e Cadastro de Atestados de Saude Ocupacional (ASO)
 **Publico-alvo**: Equipes de Automacao, TI, Suporte, Operacoes e Auditoria
 
@@ -16,6 +16,7 @@ O ASOgui e uma solucao corporativa de automacao que monitora a caixa de email co
 ### 2.1 O que o sistema faz
 - Ler emails do Outlook (conta e caixa configuradas)
 - Baixar anexos PDF
+- Baixar anexos a partir de links do Google Drive (quando detectados)
 - Converter PDF em imagens
 - Executar OCR com Tesseract
 - Extrair Nome, CPF, Data e Funcao/Cargo
@@ -23,6 +24,7 @@ O ASOgui e uma solucao corporativa de automacao que monitora a caixa de email co
 - Salvar PDF renomeado na pasta de destino
 - Acionar o bot RPA (modulo `rpa_yube`)
 - Gerar relatorios (JSON + Markdown)
+- Gerar manifesto de execucao (JSON)
 - Enviar email de resumo
 
 ### 2.2 O que o sistema nao faz
@@ -36,6 +38,7 @@ O ASOgui e uma solucao corporativa de automacao que monitora a caixa de email co
 ### 3.1 Componentes principais
 - **ASOgui (main.py)**: orquestracao e processamento principal
 - **Runner/Updater (runner.py)**: instalacao e atualizacao onedir
+- **ASO admissional (aso_admissional_email.py)**: fluxo auxiliar para anexos de ASO admissional
 - **OCR Stack**: Tesseract + Poppler + pdf2image + pytesseract
 - **Integracao Outlook**: pywin32 (COM)
 - **RPA**: modulo proprietario `rpa_yube`
@@ -64,6 +67,7 @@ Outlook -> Download PDF -> pdf2image -> OCR (Tesseract)
 Principais arquivos e pastas:
 - `main.py`: fluxo principal
 - `runner.py`: updater/launcher
+- `aso_admissional_email.py`: fluxo auxiliar para ASO admissional
 - `reporting.py`: relatorios
 - `notification.py`: email resumo
 - `utils_masking.py`: mascaramento de CPF
@@ -98,13 +102,27 @@ Copie `.env.example` para `.env` e configure as variaveis:
 
 | Variavel | Descricao | Exemplo |
 | --- | --- | --- |
-| `TESSERACT_PATH` | Caminho absoluto do `tesseract.exe` | `C:\Program Files\Tesseract-OCR\tesseract.exe` |
+| `PROCESSO_ASO_BASE` | Base de saida (logs, relatorios, processados, erros) | `P:\ProcessoASO` |
+| `TESSERACT_PATH` | Caminho absoluto do `tesseract.exe` (ou pasta) | `C:\Program Files\Tesseract-OCR\tesseract.exe` |
 | `POPPLER_PATH` | Caminho do Poppler (bin) | `C:\Tools\poppler\bin` |
 | `ASO_EMAIL_ACCOUNT` | Conta principal Outlook | `aso@empresa.com.br` |
 | `ASO_MAILBOX_NAME` | Nome da caixa compartilhada | `Aso` |
-| `ASO_NOTIFY_TO` | Destinatarios de resumo | `a@empresa.com.br;b@empresa.com.br` |
 | `ASO_EMAIL_FROM` | Remetente (opcional) | `aso@empresa.com.br` |
-| `ASO_DAYS_BACK` | Dias retroativos | `0` |
+| `ASO_NOTIFY_TO` | Destinatarios de resumo | `a@empresa.com.br;b@empresa.com.br` |
+| `ASO_EMAIL_TO` | Alias para destinatarios | `a@empresa.com.br;b@empresa.com.br` |
+| `ASO_DAYS_BACK` | Dias retroativos (main default 0; admissional default 3) | `0` |
+| `ASO_GDRIVE_NAME_FILTER` | Filtro de nome para links do Google Drive | `asos enesa` |
+| `ASO_GDRIVE_TIMEOUT_SEC` | Timeout de download (segundos) | `60` |
+| `YUBE_URL` | URL base do Yube | `https://yube.com.br/` |
+| `YUBE_USER` | Usuario do Yube | `usuario@empresa.com.br` |
+| `YUBE_PASS` | Senha do Yube | `senha_aqui` |
+| `YUBE_NAV_TIMEOUT` | Timeout de navegacao (ms) | `10000` |
+| `ASO_SUBJECT_PREFIX` | Prefixo de assunto (script admissional) | `ASO ADMISSIONAL` |
+| `ASO_STORE_NAME` | Nome da Store no Outlook (script admissional) | `Aso` |
+| `ASO_DEST_BASE` | Base de saida do script admissional | `P:\ASO_ADMISSIONAL` |
+| `ASO_ATTACH_EXTS` | Extensoes aceitas (separadas por virgula) | `.pdf` |
+| `ASO_MAX_EMAILS` | Limite de emails (script admissional) | `400` |
+| `ASO_MAPI_SCAN_DEPTH` | Profundidade de varredura (script admissional) | `6` |
 
 ### 6.2 `config.json` (Runner)
 Usado pelo updater:
@@ -119,6 +137,9 @@ Usado pelo updater:
 | `allow_prerelease` | Permite pre-release |
 | `run_args` | Argumentos passados ao app |
 | `log_level` | Nivel de log |
+| `ui` | Habilita UI do Runner |
+
+Observacao: o Runner procura `config.json` ao lado do executavel ou no diretorio atual. Tambem aceita `--config "C:\caminho\config.json"`.
 
 ---
 
@@ -126,6 +147,11 @@ Usado pelo updater:
 ### 7.1 Scripts oficiais
 - `scripts\build_aso_zip.ps1` (recomendado): gera ZIP completo + SHA256 + `latest.json`
 - `scripts\build_windows.ps1`: gera `dist\ASOgui` (onedir)
+
+Notas:
+- `build_aso_zip.ps1` aceita `PYTHON_EXE` para indicar o `python.exe`.
+- Os browsers do Playwright sao instalados em `%TEMP%` e copiados para o pacote.
+- `build_windows.ps1` cria `.venv-build` e instala browsers no projeto.
 
 ### 7.2 Auto-bump de versao
 O `build_aso_zip.ps1` incrementa a versao automaticamente (patch) quando `-Version` nao e informado. Parametros:
@@ -185,7 +211,11 @@ dist\ASOgui\
 - `ASOguiRunner.exe` ou `python runner.py`
 - O runner faz update (rede/GitHub), instala e executa.
 
-### 9.3 Agendamento (Task Scheduler)
+### 9.3 Script auxiliar (ASO admissional)
+- `python aso_admissional_email.py`
+- Usa `ASO_DEST_BASE` como base de saida e `ASO_SUBJECT_PREFIX` como filtro de assunto.
+
+### 9.4 Agendamento (Task Scheduler)
 1. Abrir Agendador de Tarefas
 2. Criar tarefa
 3. Acao: executar `C:\ASOgui\ASOguiRunner.exe`
@@ -195,13 +225,22 @@ dist\ASOgui\
 
 ## 10. Logs, relatorios e evidencias
 ### 10.1 Logs
-- Pasta `logs/`
-- Arquivo de diagnostico: `logs\diagnostico_ultima_execucao.txt`
-- Runner: `aso_last_run.log`
+Base: `PROCESSO_ASO_BASE` (default `P:\ProcessoASO`)
+Pastas base: `processados`, `em processamento`, `erros`, `logs`, `relatorios`
+- `logs\execution_log_YYYY-MM-DD.jsonl`
+- `logs\diagnostico_ultima_execucao.txt`
+- `logs\rpa_yube_debug.log`
+- `logs\rpa_log.csv`
+
+Runner (instalacao):
+- `C:\ASOgui\runner\runner.log`
+- `C:\ASOgui\runner\aso_last_run.log`
 
 ### 10.2 Relatorios
-- JSON: `relatorios\relatorio_YYYYMMDD_HHMMSS.json`
-- Markdown: `relatorios\resumo_execucao_YYYYMMDD_HHMMSS.md`
+Base: `PROCESSO_ASO_BASE\relatorios`
+- JSON: `relatorio_YYYYMMDD_HHMMSS.json`
+- Markdown: `resumo_execucao_YYYYMMDD_HHMMSS.md`
+- Manifesto: `manifest_*.json`
 
 ### 10.3 Mascaramento de PII
 - CPF e mascarado em relatorios e textos com `utils_masking.py`
@@ -246,10 +285,15 @@ A suite cobre:
 **Causa**: `latest.json` incorreto ou falta do pacote na rede.
 **Solucao**: validar `config.json`, SHA256 e permissao de acesso ao compartilhamento.
 
+### 12.6 Links do Google Drive nao baixam
+**Causa**: filtro de nome nao corresponde ou timeout curto.
+**Solucao**: revisar `ASO_GDRIVE_NAME_FILTER` e `ASO_GDRIVE_TIMEOUT_SEC`.
+
 ---
 
 ## 13. Seguranca e conformidade
 - Nao versionar `.env` com senhas
+- Manter `.env.example` com valores de exemplo (sem credenciais reais)
 - Proteger pastas `logs/` e `relatorios/` com controle de acesso
 - Restringir acesso ao `config.json` no ambiente de producao
 - Registrar alteracoes com controle de versao e changelog interno
