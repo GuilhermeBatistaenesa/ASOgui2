@@ -38,6 +38,7 @@ from rpa_yube import run_from_main
 from custom_logger import RpaLogger
 from reporting import ReportGenerator
 from notification import enviar_resumo_email
+from auditoria_excel import log_run
 from outcomes import (
     SUCCESS,
     ERROR,
@@ -260,6 +261,86 @@ def salvar_diagnostico_resumo(stats, manifest_path=None, report_paths=None, extr
             f.write("\n".join(lines))
     except Exception:
         pass
+
+
+def _calc_resultado_final(total_processado, total_sucesso, total_erro):
+    try:
+        total_processado = int(total_processado or 0)
+        total_sucesso = int(total_sucesso or 0)
+        total_erro = int(total_erro or 0)
+    except Exception:
+        return "Incompleto"
+
+    if total_processado == 0:
+        return "Incompleto"
+    if total_sucesso + total_erro != total_processado:
+        return "Incompleto"
+    if total_sucesso == total_processado:
+        return "100% Concluído"
+    return "Concluído com Exceções"
+
+
+def _build_auditoria_run_data(stats_gerais, execution_id, started_at, finished_at, fatal_error=None):
+    total_sucesso = 0
+    total_erro = 0
+    total_processado = 0
+    observacoes = ""
+
+    if stats_gerais:
+        total_sucesso = int(stats_gerais.get("success", 0) or 0)
+        total_erro = int(stats_gerais.get("error", 0) or 0)
+        total_processado = int(stats_gerais.get("total_processed", total_sucesso + total_erro) or 0)
+        observacoes = stats_gerais.get("last_error", "") or ""
+
+    if fatal_error:
+        observacoes = observacoes or fatal_error
+
+    resultado_final = _calc_resultado_final(total_processado, total_sucesso, total_erro)
+
+    if total_processado == 0 and (fatal_error or (stats_gerais and stats_gerais.get("run_status") == "INCONSISTENT")):
+        resultado_final = "Incompleto"
+
+    return {
+        "run_id": execution_id,
+        "robo_nome": "ASO",
+        "origem_codigo": r"P:\ProcessosASO\codigos",
+        "started_at": started_at.isoformat() if isinstance(started_at, datetime) else started_at,
+        "finished_at": finished_at.isoformat() if isinstance(finished_at, datetime) else finished_at,
+        "duracao_segundos": int((finished_at - started_at).total_seconds()) if isinstance(started_at, datetime) and isinstance(finished_at, datetime) else None,
+        "total_processado": total_processado,
+        "total_sucesso": total_sucesso,
+        "total_erro": total_erro,
+        "erros_auto_mitigados": 0,
+        "erros_manuais": 0,
+        "resultado_final": resultado_final,
+        "observacoes": observacoes,
+    }
+
+
+def _map_auditoria_errors(stats_gerais, execution_id):
+    if not stats_gerais:
+        return []
+    errors = []
+    now_iso = datetime.now().isoformat()
+    for err in stats_gerais.get("erros", []):
+        if not isinstance(err, dict):
+            continue
+        mensagem = err.get("erro", "") or ""
+        etapa = err.get("etapa") or err.get("arquivo") or ""
+        registro_id = err.get("registro_id") or err.get("arquivo") or ""
+        errors.append({
+            "run_id": execution_id,
+            "robo_nome": "ASO",
+            "timestamp": err.get("timestamp") or now_iso,
+            "etapa": etapa,
+            "tipo_erro": err.get("tipo_erro") or "Tecnico",
+            "codigo_erro": err.get("codigo_erro") or "",
+            "mensagem_resumida": mensagem[:500],
+            "registro_id": registro_id,
+            "mitigacao": err.get("mitigacao") or "Pendente",
+            "resolvido_em": err.get("resolvido_em") or "",
+        })
+    return errors
 
 # ====================================================================
 # HASH DE ARQUIVO
@@ -1413,6 +1494,7 @@ def captar_emails(limit=200, execution_id=None, started_at=None, manifest=None):
         )
 
         registrar_log(f"Mensagens verificadas hoje: {encontrados_hoje}; mensagens processadas: {processados}")
+        return stats_gerais
         
         
         
@@ -1427,6 +1509,8 @@ if __name__ == "__main__":
     execution_id = str(uuid.uuid4())
     started_at = datetime.now()
     logger.set_execution_id(execution_id)
+    stats_gerais = None
+    fatal_error = None
     manifest = {
         'execution_id': execution_id,
         'started_at': started_at.isoformat(),
@@ -1441,12 +1525,20 @@ if __name__ == "__main__":
     }
     registrar_log("===== INICIO DO PROCESSAMENTO DIARIO DE ASO =====", context={"execution_id": execution_id})
     try:
-        captar_emails(limit=500, execution_id=execution_id, started_at=started_at, manifest=manifest)
+        stats_gerais = captar_emails(limit=500, execution_id=execution_id, started_at=started_at, manifest=manifest)
     except Exception as e:
+        fatal_error = str(e)
         registrar_log(f"Erro fatal: {e}")
         try:
             with open(os.path.join(PASTA_ERROS, "erro_fatal.txt"), "w", encoding="utf-8") as f:
                 f.write(traceback.format_exc())
         except:
             pass
+    finished_at = datetime.now()
+    try:
+        run_data = _build_auditoria_run_data(stats_gerais, execution_id, started_at, finished_at, fatal_error=fatal_error)
+        error_rows = _map_auditoria_errors(stats_gerais, execution_id)
+        log_run(run_data, errors=error_rows)
+    except Exception as e:
+        registrar_log(f"Falha ao atualizar auditoria Excel: {e}")
     registrar_log("===== FIM DO PROCESSAMENTO =====", context={"execution_id": execution_id})

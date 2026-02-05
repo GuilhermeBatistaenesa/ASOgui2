@@ -36,9 +36,9 @@ O ASOgui e uma solucao corporativa de automacao que monitora a caixa de email co
 
 ## 3. Arquitetura e componentes
 ### 3.1 Componentes principais
-- **ASOgui (main.py)**: orquestracao e processamento principal
-- **Runner/Updater (runner.py)**: instalacao e atualizacao onedir
-- **ASO admissional (aso_admissional_email.py)**: fluxo auxiliar para anexos de ASO admissional
+- **ASOgui (src/main.py)**: orquestracao e processamento principal
+- **Runner/Updater (src/runner.py)**: instalacao e atualizacao onedir
+- **ASO admissional (src/aso_admissional_email.py)**: fluxo auxiliar para anexos de ASO admissional
 - **OCR Stack**: Tesseract + Poppler + pdf2image + pytesseract
 - **Integracao Outlook**: pywin32 (COM)
 - **RPA**: modulo proprietario `rpa_yube`
@@ -65,9 +65,9 @@ Outlook -> Download PDF -> pdf2image -> OCR (Tesseract)
 
 ## 4. Estrutura do repositorio
 Principais arquivos e pastas:
-- `main.py`: fluxo principal
-- `runner.py`: updater/launcher
-- `aso_admissional_email.py`: fluxo auxiliar para ASO admissional
+- `src/main.py`: fluxo principal
+- `src/runner.py`: updater/launcher
+- `src/aso_admissional_email.py`: fluxo auxiliar para ASO admissional
 - `reporting.py`: relatorios
 - `notification.py`: email resumo
 - `utils_masking.py`: mascaramento de CPF
@@ -204,15 +204,15 @@ dist\ASOgui\
 
 ## 9. Operacao
 ### 9.1 Execucao manual (desenvolvimento)
-- Terminal: `python main.py`
+- Terminal: `python src/main.py`
 - Clique: `run_main.bat`
 
 ### 9.2 Execucao com Runner (producao)
-- `ASOguiRunner.exe` ou `python runner.py`
+- `ASOguiRunner.exe` ou `python src/runner.py`
 - O runner faz update (rede/GitHub), instala e executa.
 
 ### 9.3 Script auxiliar (ASO admissional)
-- `python aso_admissional_email.py`
+- `python src/aso_admissional_email.py`
 - Usa `ASO_DEST_BASE` como base de saida e `ASO_SUBJECT_PREFIX` como filtro de assunto.
 
 ### 9.4 Agendamento (Task Scheduler)

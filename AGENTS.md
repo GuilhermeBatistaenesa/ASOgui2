@@ -21,7 +21,7 @@ Automacao de ASO a partir do Outlook. Processa PDFs com OCR (Tesseract + Poppler
    pip install -r requirements.txt
    ```
 3. Execute:
-   - `python main.py`
+   - `python src/main.py`
    - ou `.\run_main.bat`
 
 **Variaveis De Ambiente (principais)**
@@ -66,11 +66,11 @@ Saidas:
 - `.\build\` (arquivos intermediarios do PyInstaller)
 
 **Runner/Updater**
-- Script: `.\runner.py`
+- Script: `.\src\runner.py`
 - Config: `.\config.json`
 - Build runner (onefile):
   ```bash
-  pyinstaller --onefile --noconsole --name ASOguiRunner runner.py
+  pyinstaller --onefile --noconsole --name ASOguiRunner src\runner.py
   ```
 Campos importantes em `.\config.json`:
 - `network_release_dir`, `network_latest_json`
@@ -82,7 +82,7 @@ Campos importantes em `.\config.json`:
 Config pode ser passado com `--config "C:\caminho\config.json"`.
 
 **Script Auxiliar (ASO admissional)**
-- `python aso_admissional_email.py`
+- `python src/aso_admissional_email.py`
 - Usa `ASO_DEST_BASE`, `ASO_SUBJECT_PREFIX`, `ASO_ATTACH_EXTS`, `ASO_MAX_EMAILS`, `ASO_MAPI_SCAN_DEPTH`
 
 **Ferramentas (Tesseract/Poppler)**

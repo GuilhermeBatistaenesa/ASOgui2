@@ -26,7 +26,7 @@ Este projeto automatiza o recebimento e o cadastro de Atestados de Saude Ocupaci
    pip install -r requirements.txt
    ```
 3) Rode o fluxo:
-   - Terminal: `python main.py`
+   - Terminal: `python src/main.py`
    - Clique: `run_main.bat`
 
 ## Variaveis de ambiente (principais)
@@ -52,7 +52,7 @@ Base: `PROCESSO_ASO_BASE` (default `P:\ProcessoASO`)
 - `relatorios` (ex.: `relatorio_*.json`, `resumo_execucao_*.md`, `manifest_*.json`)
 
 ## Atalhos .bat (sem terminal)
-- `run_main.bat` -> executa `main.py`
+- `run_main.bat` -> executa `src/main.py`
 - `run_tests.bat` -> executa pytest
 - `build_zip.bat [patch|minor|major|1.2.3]` -> gera ZIP + latest.json + sha256
 - `build_windows.bat` -> gera `dist\ASOgui` (onedir)
@@ -66,11 +66,12 @@ powershell -ExecutionPolicy Bypass -File scripts\build_aso_zip.ps1
 - O ZIP e o `latest.json` sao gravados em `dist\`.
 
 ## Estrutura do projeto
-- `main.py`: orquestracao principal
-- `runner.py`: updater/launcher (instalacao onedir)
-- `reporting.py`: relatorios
-- `notification.py`: email de resumo
-- `utils_masking.py`: mascaramento de PII (CPF)
+- `src/`: codigo-fonte do ASOgui
+- `src/main.py`: orquestracao principal
+- `src/runner.py`: updater/launcher (instalacao onedir)
+- `src/reporting.py`: relatorios
+- `src/notification.py`: email de resumo
+- `src/utils_masking.py`: mascaramento de PII (CPF)
 - `scripts/`: builds e empacotamento
 - `tests/`: testes automatizados
 
@@ -81,7 +82,7 @@ python -m pytest
 Ou clique em `run_tests.bat`.
 
 ## Script auxiliar: ASO admissional
-O `aso_admissional_email.py` e um fluxo simples para baixar anexos de ASO admissional.
+O `src/aso_admissional_email.py` e um fluxo simples para baixar anexos de ASO admissional.
 - Base de saida: `ASO_DEST_BASE` (default `P:\ASO_ADMISSIONAL`)
 - Filtros: `ASO_SUBJECT_PREFIX`, `ASO_ATTACH_EXTS`
 - Outlook: `ASO_STORE_NAME`, `ASO_MAILBOX_NAME`, `ASO_EMAIL_ACCOUNT`

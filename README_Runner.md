@@ -45,7 +45,7 @@ Notas:
 
 ## Runner (PyInstaller)
 ```bash
-pyinstaller --onefile --noconsole --name ASOguiRunner runner.py
+pyinstaller --onefile --noconsole --name ASOguiRunner src/runner.py
 ```
 
 ---
@@ -129,7 +129,7 @@ vendor\tesseract\Tesseract-OCR\tesseract.exe
 
 ## Execucao
 - Runner instalado: `ASOguiRunner.exe`
-- Python local: `python runner.py`
+- Python local: `python src/runner.py`
 
 ---
 

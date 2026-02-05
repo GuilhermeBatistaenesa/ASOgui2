@@ -2,7 +2,7 @@
 
 
 a = Analysis(
-    ['runner.py'],
+    ['src/runner.py'],
     pathex=[],
     binaries=[],
     datas=[],

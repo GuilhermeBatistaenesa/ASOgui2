@@ -6,6 +6,8 @@ set "PYTHON_EXE="
 if exist ".venv\Scripts\python.exe" set "PYTHON_EXE=.venv\Scripts\python.exe"
 if not defined PYTHON_EXE set "PYTHON_EXE=python"
 
+set "PYTHONPATH=%~dp0src"
+
 echo Running tests with %PYTHON_EXE%
 %PYTHON_EXE% -m pytest %*
 set "EXIT_CODE=%ERRORLEVEL%"
