@@ -12,6 +12,7 @@ from utils_masking import mask_cpf, mask_cpf_in_text
 
 
 import sys
+import subprocess
 
 def _load_env():
     candidates = []
@@ -26,6 +27,14 @@ def _load_env():
     load_dotenv()
 
 _load_env()
+
+def _ensure_playwright_chromium_installed():
+    try:
+        subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"])
+        return True
+    except Exception as e:
+        logging.error(f"Falha ao instalar Chromium (Playwright): {e}")
+        return False
 
 
 # ---------- CONFIGURAÇÃO ----------
@@ -754,16 +763,36 @@ def process_folder(base_path, headless=False, max_files=None, specific_files=Non
 
     with sync_playwright() as p:
         # ... (setup do browser) ...
-        browser = p.chromium.launch(
-            headless=headless,
-            args=[
-                "--ignore-certificate-errors",
-                "--disable-http2",
-                "--disable-features=AllowInsecureLocalhost,SSLVersionFallback",
-                "--no-sandbox",
-                "--disable-web-security",
-            ],
-        )
+        try:
+            browser = p.chromium.launch(
+                headless=headless,
+                args=[
+                    "--ignore-certificate-errors",
+                    "--disable-http2",
+                    "--disable-features=AllowInsecureLocalhost,SSLVersionFallback",
+                    "--no-sandbox",
+                    "--disable-web-security",
+                ],
+            )
+        except Exception as e:
+            msg = str(e)
+            if "Executable doesn't exist" in msg or "playwright install" in msg:
+                logging.warning("Chromium do Playwright nao encontrado. Instalando automaticamente...")
+                if _ensure_playwright_chromium_installed():
+                    browser = p.chromium.launch(
+                        headless=headless,
+                        args=[
+                            "--ignore-certificate-errors",
+                            "--disable-http2",
+                            "--disable-features=AllowInsecureLocalhost,SSLVersionFallback",
+                            "--no-sandbox",
+                            "--disable-web-security",
+                        ],
+                    )
+                else:
+                    raise
+            else:
+                raise
         context = browser.new_context(ignore_https_errors=True)
         page = context.new_page()
         page = login(page)

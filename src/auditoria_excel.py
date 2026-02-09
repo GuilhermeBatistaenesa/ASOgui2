@@ -146,7 +146,7 @@ def log_run(
     if target_dir:
         os.makedirs(target_dir, exist_ok=True)
 
-    wb, created = _ensure_workbook(path)
+    wb, created, invalid_existing = _ensure_workbook(path)
     ws_runs = wb[RUNS_SHEET]
     ws_errors = wb[ERRORS_SHEET]
     ws_robos = wb[ROBOS_SHEET]
@@ -154,6 +154,9 @@ def log_run(
     _append_run(ws_runs, run_data)
     _append_errors(ws_errors, run_data, errors)
     _upsert_robo(ws_robos, run_data)
+
+    if invalid_existing:
+        logger.warning("Arquivo de auditoria estava invalido. Um novo XLSX foi criado.")
 
     try:
         wb.save(path)
@@ -166,10 +169,18 @@ def log_run(
     return run_id
 
 
-def _ensure_workbook(path: str) -> Tuple[Workbook, bool]:
+def _ensure_workbook(path: str) -> Tuple[Workbook, bool, bool]:
     created = False
+    invalid_existing = False
     if os.path.exists(path):
-        wb = load_workbook(path)
+        try:
+            wb = load_workbook(path)
+        except Exception as exc:
+            logger.error("Falha ao abrir XLSX existente (%s): %s", path, exc)
+            _backup_corrupt_file(path)
+            wb = Workbook()
+            created = True
+            invalid_existing = True
     else:
         wb = Workbook()
         created = True
@@ -190,7 +201,20 @@ def _ensure_workbook(path: str) -> Tuple[Workbook, bool]:
             _setup_robos_sheet(wb.create_sheet(ROBOS_SHEET))
         if DASHBOARD_SHEET not in wb.sheetnames:
             _setup_dashboard_sheet(wb.create_sheet(DASHBOARD_SHEET))
-    return wb, created
+    return wb, created, invalid_existing
+
+
+def _backup_corrupt_file(path: str) -> None:
+    try:
+        base_dir = os.path.dirname(path)
+        name, ext = os.path.splitext(os.path.basename(path))
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_path = os.path.join(base_dir, f"{name}__CORROMPIDO__{timestamp}{ext or '.xlsx'}")
+        if os.path.exists(path):
+            os.replace(path, backup_path)
+            logger.info("Backup do arquivo corrompido criado em %s", backup_path)
+    except Exception as exc:
+        logger.error("Falha ao mover arquivo corrompido: %s", exc)
 
 
 def _setup_runs_sheet(ws) -> None:

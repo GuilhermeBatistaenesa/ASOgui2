@@ -150,6 +150,8 @@ reporter = ReportGenerator(PASTA_RELATORIOS)
 TARGET_ACCOUNT = os.getenv("ASO_EMAIL_ACCOUNT", "aso@enesa.com.br")
 GDRIVE_NAME_FILTER = os.getenv("ASO_GDRIVE_NAME_FILTER", "asos enesa").strip().lower()
 GDRIVE_TIMEOUT_SEC = int(os.getenv("ASO_GDRIVE_TIMEOUT_SEC", "60"))
+DEBUG_MODE = os.getenv("ASO_DEBUG", "").strip().lower() in ("1", "true", "yes")
+REPROCESS_EXISTING = os.getenv("ASO_REPROCESS_EXISTING", "").strip().lower() in ("1", "true", "yes")
 
 
 # ====================================================================
@@ -387,18 +389,20 @@ def extrair_dados_completos(img, texto_ocr=None, _retry=False):
 
     # Checagem de Rascunho
     if "RASCUNHO" in texto.upper() and texto.upper().count("RASCUNHO") > 3:
-         print("INFO: Arquivo identificado como RASCUNHO. Ignorando.")
+         if DEBUG_MODE:
+             print("INFO: Arquivo identificado como RASCUNHO. Ignorando.")
          return "RASCUNHO", "Ignorar", "", "", texto_ocr
 
     # Normalizar um pouco o texto para buscas
     texto_compacto = re.sub(r"\s+", " ", texto)
 
     # DEBUG: Mostrar primeiros caracteres para verificar qualidade
-    if len(texto) > 0:
-        clean_debug = texto_compacto[:300].encode('ascii', 'ignore').decode('ascii')
-        print(f"DEBUG OCR RAW (start): {clean_debug}...")
-    else:
-        print("DEBUG OCR RAW: Vazio!")
+    if DEBUG_MODE:
+        if len(texto) > 0:
+            clean_debug = texto_compacto[:300].encode('ascii', 'ignore').decode('ascii')
+            print(f"DEBUG OCR RAW (start): {clean_debug}...")
+        else:
+            print("DEBUG OCR RAW: Vazio!")
 
     # ---------------- CPF ----------------
     cpf = "CPF_Desconhecido"
@@ -468,7 +472,7 @@ def extrair_dados_completos(img, texto_ocr=None, _retry=False):
             return extrair_dados_completos(img, texto_ocr=texto2, _retry=True)
 
     # Debug para casos falhos (apos fallback)
-    if nome == "Desconhecido":
+    if nome == "Desconhecido" and DEBUG_MODE:
         registrar_log(f"DEBUG OCR FALHO (CPF={mask_cpf(cpf)}): Texto parcial: {texto[:200].replace(chr(10), ' ')}")
 
     # >>> HEURÍSTICA: Se ainda desconhecido, procurar nas linhas acima do CPF
@@ -541,12 +545,13 @@ def extrair_dados_completos(img, texto_ocr=None, _retry=False):
         nome = "Desconhecido"
         
     # --- DIAGNÓSTICO PARA O USUÁRIO ---
-    if cpf == "CPF_Desconhecido":
-        print("ALERTA DE LEITURA: Nao foi possivel ler o CPF neste arquivo.")
-        registrar_log(f"DEBUG OCR: Falha CPF", context={"partial_text": texto[:100], "status": "CPF_MISSING"})
-    elif nome == "Desconhecido":
-        print(f"ALERTA DE LEITURA: CPF encontrado ({mask_cpf(cpf)}), mas NOME nao identificado.")
-        registrar_log(f"DEBUG OCR: Falha Nome", context={"cpf": cpf, "partial_text": texto[:100], "status": "NAME_MISSING"})
+    if DEBUG_MODE:
+        if cpf == "CPF_Desconhecido":
+            print("ALERTA DE LEITURA: Nao foi possivel ler o CPF neste arquivo.")
+            registrar_log(f"DEBUG OCR: Falha CPF", context={"partial_text": texto[:100], "status": "CPF_MISSING"})
+        elif nome == "Desconhecido":
+            print(f"ALERTA DE LEITURA: CPF encontrado ({mask_cpf(cpf)}), mas NOME nao identificado.")
+            registrar_log(f"DEBUG OCR: Falha Nome", context={"cpf": cpf, "partial_text": texto[:100], "status": "NAME_MISSING"})
     else:
         # Sucesso parcial (debug)
         pass # print(f"   (Leitura OK: {nome} | {cpf})")
@@ -724,6 +729,11 @@ def salvar_paginas_individualmente(pdf_path, pasta_destino, numero_obra, lista_n
             caminho_final = os.path.join(pasta_destino, nome_final)
 
             if should_skip_duplicate(caminho_final):
+                if REPROCESS_EXISTING:
+                    registrar_log(f"Arquivo ja existe; reprocessando no RPA: {caminho_final}")
+                    if lista_novos_arquivos is not None and caminho_final not in lista_novos_arquivos:
+                        lista_novos_arquivos.append(caminho_final)
+                    continue
                 registrar_log(f"Arquivo ja existe na pasta (nao sobrescrito): {caminho_final}")
                 if stats is not None:
                     stats["skipped_duplicate"] += 1
@@ -1059,6 +1069,15 @@ def captar_emails(limit=200, execution_id=None, started_at=None, manifest=None):
                     if t.tzinfo:
                         t = t.astimezone().replace(tzinfo=None)
                     return t
+                try:
+                    # pywintypes.Time or similar COM time
+                    return datetime(t.year, t.month, t.day, t.hour, t.minute, t.second)
+                except Exception:
+                    pass
+                try:
+                    return datetime.fromtimestamp(float(t))
+                except Exception:
+                    pass
             except Exception:
                 continue
         return None
@@ -1074,12 +1093,95 @@ def captar_emails(limit=200, execution_id=None, started_at=None, manifest=None):
         except Exception:
             return None
 
+    def _dump_stores_and_folders(ns):
+        if not DEBUG_MODE:
+            return
+        try:
+            stores = []
+            for st in ns.Stores:
+                try:
+                    stores.append({
+                        "DisplayName": getattr(st, "DisplayName", ""),
+                        "FilePath": getattr(st, "FilePath", ""),
+                    })
+                except Exception:
+                    continue
+            registrar_log("Outlook Stores:", context={"stores": stores})
+        except Exception:
+            pass
+
+        try:
+            folder_paths = []
+            for f in ns.Folders:
+                try:
+                    folder_paths.append(getattr(f, "FolderPath", ""))
+                except Exception:
+                    continue
+            registrar_log("Outlook Folders (root):", context={"folders": folder_paths})
+        except Exception:
+            pass
+
+    def _find_best_inbox(ns, inicio_janela, inicio_amanha):
+        pattern = re.compile(
+            r"(?:ENC:|RE:|FWD:|FW:)?\s*ASO\s+ADMISSIONAL",
+            re.IGNORECASE,
+        )
+        best = None
+        candidates = []
+        for root in ns.Folders:
+            try:
+                store_name = getattr(root, "Name", "")
+                inbox = None
+                try:
+                    inbox = root.Folders("Caixa de Entrada")
+                except Exception:
+                    try:
+                        inbox = root.Folders("Inbox")
+                    except Exception:
+                        inbox = None
+                if not inbox:
+                    continue
+                items = inbox.Items
+                try:
+                    items.Sort("[ReceivedTime]", True)
+                except Exception:
+                    items.Sort("ReceivedTime", True)
+                latest_dt = None
+                has_match_today = False
+                for i in range(1, min(50, items.Count) + 1):
+                    try:
+                        msg = items.Item(i)
+                        drec = _get_msg_datetime(msg)
+                        if drec and (latest_dt is None or drec > latest_dt):
+                            latest_dt = drec
+                        subj = msg.Subject or ""
+                        if drec and inicio_janela <= drec < inicio_amanha and pattern.search(subj):
+                            has_match_today = True
+                            break
+                    except Exception:
+                        continue
+                candidates.append({
+                    "store": store_name,
+                    "folder": getattr(inbox, "FolderPath", ""),
+                    "latest": latest_dt.isoformat() if latest_dt else None,
+                    "has_match_today": has_match_today,
+                })
+                score = (1 if has_match_today else 0, latest_dt or datetime.min)
+                if best is None or score > best["score"]:
+                    best = {"inbox": inbox, "score": score}
+            except Exception:
+                continue
+        if candidates and DEBUG_MODE:
+            registrar_log("Candidatos Inbox (auto):", context={"candidates": candidates})
+        return best["inbox"] if best else None
+
     def _capta_core():
         registrar_log("Iniciando leitura do Outlook...")
         anexos_processados = set()
 
         try:
             app, outlook = get_outlook_namespace_robusto()
+            _dump_stores_and_folders(outlook)
 
             conta_destino = None
 
@@ -1152,6 +1254,7 @@ def captar_emails(limit=200, execution_id=None, started_at=None, manifest=None):
         
         processados = 0
         encontrados_hoje = 0
+        sample_subjects = []
         
         inicio_hoje = datetime.now().replace(
             hour=0, minute=0, second=0, microsecond=0
@@ -1203,6 +1306,29 @@ def captar_emails(limit=200, execution_id=None, started_at=None, manifest=None):
         indices = list(range(1, min(limit, mensagens.Count) + 1))
         
         registrar_log(f"Total de mensagens na caixa de entrada: {mensagens.Count}")
+        if DEBUG_MODE:
+            try:
+                debug_samples = []
+                for di in range(1, min(5, mensagens.Count) + 1):
+                    try:
+                        dmsg = mensagens.Item(di)
+                        rt = getattr(dmsg, "ReceivedTime", None)
+                        st = getattr(dmsg, "SentOn", None)
+                        ct = getattr(dmsg, "CreationTime", None)
+                        parsed = _get_msg_datetime(dmsg)
+                        debug_samples.append({
+                            "received_raw": str(rt),
+                            "sent_raw": str(st),
+                            "creation_raw": str(ct),
+                            "parsed": parsed.isoformat() if parsed else None,
+                            "subject": (dmsg.Subject or "")[:80],
+                        })
+                    except Exception:
+                        continue
+                if debug_samples:
+                    registrar_log("Debug datas amostra (top 5):", context={"samples": debug_samples})
+            except Exception:
+                pass
         # Se a caixa atual nao tiver emails de hoje, tenta inbox compartilhado
         if EMAIL_DESEJADO:
             try:
@@ -1226,6 +1352,37 @@ def captar_emails(limit=200, execution_id=None, started_at=None, manifest=None):
                         inbox = shared_inbox
                         mensagens = shared_items
                         registrar_log(f"Usando inbox compartilhado: {getattr(shared_inbox, 'FolderPath', 'Desconhecido')}")
+                    if today_count == 0:
+                        auto_inbox = _find_best_inbox(outlook, inicio_janela, inicio_amanha)
+                        if auto_inbox and auto_inbox is not inbox:
+                            auto_items = auto_inbox.Items
+                            try:
+                                auto_items.Sort("[ReceivedTime]", True)
+                            except Exception:
+                                auto_items.Sort("ReceivedTime", True)
+                            inbox = auto_inbox
+                            mensagens = auto_items
+                            registrar_log(f"Usando inbox auto-detectada: {getattr(auto_inbox, 'FolderPath', 'Desconhecido')}")
+                # Debug rapido: datas mais recentes na inbox atual
+                if DEBUG_MODE:
+                    try:
+                        recent_dates = []
+                        for di in range(1, min(20, mensagens.Count) + 1):
+                            try:
+                                dmsg = mensagens.Item(di)
+                                drec = _get_msg_datetime(dmsg)
+                                if drec:
+                                    recent_dates.append(drec)
+                            except Exception:
+                                continue
+                        if recent_dates:
+                            recent_dates.sort(reverse=True)
+                            registrar_log(
+                                "Debug datas recentes (top3):",
+                                context={"top3": [d.isoformat() for d in recent_dates[:3]]},
+                            )
+                    except Exception:
+                        pass
             except Exception:
                 pass
         
@@ -1250,12 +1407,21 @@ def captar_emails(limit=200, execution_id=None, started_at=None, manifest=None):
         
                 # Padrao mais flexivel: aceita prefixos (ENC/RE/FW) e pequenas variacoes
                 m = re.search(
-                    r"(?:ENC:|RE:|FWD:|FW:)?\s*ASO\s+ADMISSIONAL\s*-\s*([A-Za-z0-9]+)\s*-\s*([0-3]?\d/[0-1]?\d/\d{2,4})(?:\s*-\s*.*)?",
+                    r"(?:ENC:|RE:|FWD:|FW:)?\s*ASO\s+ADMISSIONAL\s*[-–]\s*([A-Za-z0-9]+)\s*[-–]\s*([0-3]?\d[/-][0-1]?\d[/-]\d{2,4})(?:\s*[-–]\s*.*)?",
                     assunto,
                     re.IGNORECASE
                 )
+
+                if not m:
+                    m = re.search(
+                        r"(?:ENC:|RE:|FWD:|FW:)?\s*ASO\s+ADMISSIONAL\s*[-–]\s*([A-Za-z0-9]+)(?:\s*[-–]\s*.*)?",
+                        assunto,
+                        re.IGNORECASE
+                    )
         
                 if not m:
+                    if DEBUG_MODE and len(sample_subjects) < 5:
+                        sample_subjects.append(assunto)
                     continue
         
                 numero_obra = m.group(1)
@@ -1494,6 +1660,8 @@ def captar_emails(limit=200, execution_id=None, started_at=None, manifest=None):
         )
 
         registrar_log(f"Mensagens verificadas hoje: {encontrados_hoje}; mensagens processadas: {processados}")
+        if DEBUG_MODE and processados == 0 and encontrados_hoje > 0 and sample_subjects:
+            registrar_log(f"Amostra de assuntos (hoje, nao processados): {sample_subjects}")
         return stats_gerais
         
         
