@@ -67,7 +67,17 @@ def find_tesseract():
              return os.path.join(candidate, "tesseract.exe")
         return candidate
         
-    # 2. Tenta caminhos comuns
+    # 2. Tenta vendor (repo)
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    vendor_candidates = [
+        os.path.join(os.getcwd(), "vendor", "tesseract", "Tesseract-OCR", "tesseract.exe"),
+        os.path.join(repo_root, "vendor", "tesseract", "Tesseract-OCR", "tesseract.exe"),
+    ]
+    for p in vendor_candidates:
+        if os.path.exists(p):
+            return p
+
+    # 3. Tenta caminhos comuns
     common_paths = [
         r"C:\Program Files\Tesseract-OCR\tesseract.exe",
         r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
@@ -77,7 +87,7 @@ def find_tesseract():
         if os.path.exists(p):
             return p
             
-    # 3. Tenta pelo PATH do sistema
+    # 4. Tenta pelo PATH do sistema
     which_tess = shutil.which("tesseract")
     if which_tess:
         return which_tess
@@ -136,12 +146,20 @@ PASTA_LOGS = os.path.join(PASTA_BASE, "logs")
 EMAIL_DESEJADO = os.getenv("ASO_EMAIL_ACCOUNT", "aso@enesa.com.br")
 MAILBOX_NAME = os.getenv("ASO_MAILBOX_NAME", "Aso")  # nome exibido na árvore
 
-os.makedirs(PASTA_PROCESSADOS, exist_ok=True)
-os.makedirs(PASTA_EM_PROCESSAMENTO, exist_ok=True)
-os.makedirs(PASTA_ERROS, exist_ok=True)
-os.makedirs(PASTA_LOGS, exist_ok=True)
+def _safe_makedirs(path, label):
+    try:
+        os.makedirs(path, exist_ok=True)
+    except Exception as e:
+        print(f"ERRO: Nao foi possivel criar '{label}' em '{path}'.")
+        print(f"Verifique acesso/permissoes e se o drive existe. Detalhe: {e}")
+        sys.exit(2)
+
+_safe_makedirs(PASTA_PROCESSADOS, "processados")
+_safe_makedirs(PASTA_EM_PROCESSAMENTO, "em processamento")
+_safe_makedirs(PASTA_ERROS, "erros")
+_safe_makedirs(PASTA_LOGS, "logs")
 PASTA_RELATORIOS = os.path.join(PASTA_BASE, "relatorios")
-os.makedirs(PASTA_RELATORIOS, exist_ok=True)
+_safe_makedirs(PASTA_RELATORIOS, "relatorios")
 
 # Inicializa logger e reporter
 logger = RpaLogger(PASTA_LOGS)
@@ -1329,60 +1347,25 @@ def captar_emails(limit=200, execution_id=None, started_at=None, manifest=None):
                     registrar_log("Debug datas amostra (top 5):", context={"samples": debug_samples})
             except Exception:
                 pass
-        # Se a caixa atual nao tiver emails de hoje, tenta inbox compartilhado
-        if EMAIL_DESEJADO:
+        # NOTE: Nao troca de mailbox automaticamente.
+        # A leitura deve ocorrer apenas na inbox configurada (aso@enesa.com.br).
+        if DEBUG_MODE:
             try:
-                today_count = 0
-                for di in range(1, min(50, mensagens.Count) + 1):
+                recent_dates = []
+                for di in range(1, min(20, mensagens.Count) + 1):
                     try:
                         dmsg = mensagens.Item(di)
                         drec = _get_msg_datetime(dmsg)
-                        if drec and drec.date() == inicio_hoje.date():
-                            today_count += 1
+                        if drec:
+                            recent_dates.append(drec)
                     except Exception:
                         continue
-                if today_count == 0:
-                    shared_inbox = _get_shared_inbox(outlook, EMAIL_DESEJADO)
-                    if shared_inbox and shared_inbox is not inbox:
-                        shared_items = shared_inbox.Items
-                        try:
-                            shared_items.Sort("[ReceivedTime]", True)
-                        except Exception:
-                            shared_items.Sort("ReceivedTime", True)
-                        inbox = shared_inbox
-                        mensagens = shared_items
-                        registrar_log(f"Usando inbox compartilhado: {getattr(shared_inbox, 'FolderPath', 'Desconhecido')}")
-                    if today_count == 0:
-                        auto_inbox = _find_best_inbox(outlook, inicio_janela, inicio_amanha)
-                        if auto_inbox and auto_inbox is not inbox:
-                            auto_items = auto_inbox.Items
-                            try:
-                                auto_items.Sort("[ReceivedTime]", True)
-                            except Exception:
-                                auto_items.Sort("ReceivedTime", True)
-                            inbox = auto_inbox
-                            mensagens = auto_items
-                            registrar_log(f"Usando inbox auto-detectada: {getattr(auto_inbox, 'FolderPath', 'Desconhecido')}")
-                # Debug rapido: datas mais recentes na inbox atual
-                if DEBUG_MODE:
-                    try:
-                        recent_dates = []
-                        for di in range(1, min(20, mensagens.Count) + 1):
-                            try:
-                                dmsg = mensagens.Item(di)
-                                drec = _get_msg_datetime(dmsg)
-                                if drec:
-                                    recent_dates.append(drec)
-                            except Exception:
-                                continue
-                        if recent_dates:
-                            recent_dates.sort(reverse=True)
-                            registrar_log(
-                                "Debug datas recentes (top3):",
-                                context={"top3": [d.isoformat() for d in recent_dates[:3]]},
-                            )
-                    except Exception:
-                        pass
+                if recent_dates:
+                    recent_dates.sort(reverse=True)
+                    registrar_log(
+                        "Debug datas recentes (top3):",
+                        context={"top3": [d.isoformat() for d in recent_dates[:3]]},
+                    )
             except Exception:
                 pass
         
