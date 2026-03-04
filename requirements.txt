@@ -8,3 +8,4 @@ playwright
 pytest
 pytest-mock
 openpyxl
+pyodbc

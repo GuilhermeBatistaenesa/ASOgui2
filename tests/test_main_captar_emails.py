@@ -13,6 +13,14 @@ class _FakeAttachment:
         Path(path).write_bytes(self._content)
 
 
+class _FailingAttachment:
+    def __init__(self, filename: str):
+        self.FileName = filename
+
+    def SaveAsFile(self, _path):
+        raise RuntimeError("cloud attachment")
+
+
 class _FakeAttachments:
     def __init__(self, items):
         self._items = list(items)
@@ -26,8 +34,8 @@ class _FakeAttachments:
 
 
 class _FakeMessage:
-    def __init__(self, subject, received, attachments=None, body="", html_body=""):
-        self.Class = 43
+    def __init__(self, subject, received, attachments=None, body="", html_body="", msg_class=43):
+        self.Class = msg_class
         self.Subject = subject
         self.ReceivedTime = received
         self.Body = body
@@ -167,3 +175,90 @@ def test_captar_emails_flow(load_main, tmp_path, monkeypatch):
     assert len(calls) == 2  # dedup attachments, plus gdrive
     assert manifest["email_status"] == "SENT"
     assert len(manifest["items"]) >= 2
+
+
+def test_captar_emails_falls_back_to_gdrive_when_pdf_attachment_is_reference(load_main, tmp_path, monkeypatch):
+    main = load_main(env={"ASO_EMAIL_ACCOUNT": "aso@enesa.com.br", "ASO_MAILBOX_NAME": "Aso"})
+
+    now = datetime.now()
+    subject_ok = "ASO ADMISSIONAL - 125 - 02/03/2026"
+    msg = _FakeMessage(
+        subject_ok,
+        now,
+        attachments=[_FailingAttachment("ASOS ENESA PARTE 1.pdf")],
+        body="https://drive.google.com/file/d/ABCdef12345/view",
+    )
+
+    inbox = _FakeFolder([msg])
+    account = _FakeAccount("aso@enesa.com.br", inbox)
+    namespace = _FakeNamespace(account, inbox)
+
+    monkeypatch.setattr(main, "get_outlook_namespace_robusto", lambda *_: (None, namespace))
+
+    calls = []
+
+    def _fake_salvar(pdf_path, pasta_destino, numero_obra, lista_novos_arquivos=None, stats=None, manifest_items=None):
+        calls.append(pdf_path)
+        if stats is not None:
+            stats["total_detected"] += 1
+        if lista_novos_arquivos is not None:
+            lista_novos_arquivos.append(str(Path(pasta_destino) / "JOAO - 123.456.789-01.pdf"))
+
+    monkeypatch.setattr(main, "salvar_paginas_individualmente", _fake_salvar)
+    monkeypatch.setattr(main, "run_from_main", lambda *_args, **_kwargs: {"sucessos": [], "erros": []})
+    monkeypatch.setattr(main, "enviar_resumo_email", lambda *_args, **_kwargs: ("SENT", None))
+
+    def _fake_download(_gid, dest_dir):
+        p = Path(dest_dir) / "ASOS ENESA PARTE 1.pdf"
+        p.write_bytes(b"pdf")
+        return str(p)
+
+    monkeypatch.setattr(main, "download_gdrive_file", _fake_download)
+
+    main.captar_emails(limit=10, execution_id="exec-2", started_at=now, manifest=None)
+
+    assert len(calls) == 1
+
+
+def test_captar_emails_accepts_string_datetime_and_nonstandard_mail_class(load_main, monkeypatch):
+    main = load_main(env={"ASO_EMAIL_ACCOUNT": "aso@enesa.com.br", "ASO_MAILBOX_NAME": "Aso", "ASO_DAYS_BACK": "1"})
+
+    now = datetime.now()
+    msg = _FakeMessage(
+        "ASO ADMISSIONAL - 125 - 03/03/2026",
+        now.strftime("%d/%m/%Y %H:%M:%S"),
+        attachments=[],
+        body="https://drive.google.com/file/d/ABCdef12345/view",
+        msg_class=999,
+    )
+
+    inbox = _FakeFolder([msg])
+    account = _FakeAccount("aso@enesa.com.br", inbox)
+    namespace = _FakeNamespace(account, inbox)
+
+    monkeypatch.setattr(main, "get_outlook_namespace_robusto", lambda *_: (None, namespace))
+
+    calls = []
+    monkeypatch.setattr(
+        main,
+        "salvar_paginas_individualmente",
+        lambda pdf_path, *_args, **_kwargs: calls.append(pdf_path),
+    )
+    monkeypatch.setattr(main, "run_from_main", lambda *_args, **_kwargs: {"sucessos": [], "erros": []})
+    monkeypatch.setattr(main, "enviar_resumo_email", lambda *_args, **_kwargs: ("SENT", None))
+    monkeypatch.setattr(
+        main,
+        "download_gdrive_file",
+        lambda _gid, dest_dir: str((Path(dest_dir) / "ASOS ENESA PARTE 1.pdf").write_bytes(b"pdf") or (Path(dest_dir) / "ASOS ENESA PARTE 1.pdf")),
+    )
+
+    def _fake_download(_gid, dest_dir):
+        p = Path(dest_dir) / "ASOS ENESA PARTE 1.pdf"
+        p.write_bytes(b"pdf")
+        return str(p)
+
+    monkeypatch.setattr(main, "download_gdrive_file", _fake_download)
+
+    main.captar_emails(limit=10, execution_id="exec-3", started_at=now, manifest=None)
+
+    assert len(calls) == 1

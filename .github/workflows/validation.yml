@@ -1,0 +1,17 @@
+﻿name: Validation (non-invasive)
+
+on:
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  docs-and-structure-check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate key files
+        shell: pwsh
+        run: |
+          $required = @("README.md","CHANGELOG.md")
+          foreach($f in $required){ if(-not (Test-Path $f)){ throw "Missing $f" } }
+          Write-Host "Validation passed."

@@ -21,10 +21,10 @@ _env_candidates.append(os.path.join(os.getcwd(), ".env"))
 _env_candidates.append(os.path.join(os.path.dirname(__file__), ".env"))
 for _env_path in _env_candidates:
     if _env_path and os.path.exists(_env_path):
-        load_dotenv(_env_path)
+        load_dotenv(_env_path, override=True)
         break
 else:
-    load_dotenv()
+    load_dotenv(override=True)
 import pytesseract
 from pdf2image import convert_from_path
 from datetime import datetime, timedelta
@@ -35,10 +35,10 @@ from PIL import ImageOps, ImageFilter
 from rpa_yube import run_from_main
 
 # Módulos customizados
-from custom_logger import RpaLogger
+from custom_logger import RpaLogger, emit_terminal
 from reporting import ReportGenerator
 from notification import enviar_resumo_email
-from auditoria_excel import log_run
+from auditoria_excel import log_run, get_project_version
 from outcomes import (
     SUCCESS,
     ERROR,
@@ -48,6 +48,7 @@ from outcomes import (
 )
 from utils_masking import mask_cpf, mask_cpf_in_text, mask_pii_in_obj
 from idempotency import should_skip_duplicate
+from sql_integration import insert_aso_record, parse_br_date
 
 # ----------------------------
 # CONFIGURAÇÕES
@@ -96,10 +97,10 @@ def find_tesseract():
 
 tess_path = find_tesseract()
 if tess_path:
-    print(f"DEBUG: Configured Tesseract Path: '{tess_path}'")
+    emit_terminal("DEBUG", "Tesseract localizado.", step="setup", extra={"path": tess_path})
     pytesseract.pytesseract.tesseract_cmd = tess_path
 else:
-    print("AVISO: Tesseract não encontrado automaticamente. Verifique se está instalado ou configure TESSERACT_PATH no arquivo .env")
+    emit_terminal("WARNING", "Tesseract nao encontrado automaticamente. Verifique o TESSERACT_PATH.", step="setup")
     # Mantém o default da biblioteca ou define um fallback se preferir, 
     # mas o aviso ajuda o usuário a saber o que houve.
 
@@ -134,15 +135,16 @@ def find_poppler():
 
 POPPLER_PATH = find_poppler()
 if POPPLER_PATH:
-    print(f"DEBUG: Configured Poppler Path: '{POPPLER_PATH}'")
+    emit_terminal("DEBUG", "Poppler localizado.", step="setup", extra={"path": POPPLER_PATH})
 else:
-    print("AVISO: Poppler (pdftoppm.exe) nao encontrado. Configure POPPLER_PATH no .env")
+    emit_terminal("WARNING", "Poppler nao encontrado. Configure POPPLER_PATH.", step="setup")
 
 PASTA_BASE = os.getenv("PROCESSO_ASO_BASE", r"P:\ProcessoASO")
 PASTA_PROCESSADOS = os.path.join(PASTA_BASE, "processados")
 PASTA_EM_PROCESSAMENTO = os.path.join(PASTA_BASE, "em processamento")
 PASTA_ERROS = os.path.join(PASTA_BASE, "erros")
 PASTA_LOGS = os.path.join(PASTA_BASE, "logs")
+PASTA_JSON = os.path.join(PASTA_BASE, "json")
 EMAIL_DESEJADO = os.getenv("ASO_EMAIL_ACCOUNT", "aso@enesa.com.br")
 MAILBOX_NAME = os.getenv("ASO_MAILBOX_NAME", "Aso")  # nome exibido na árvore
 
@@ -150,26 +152,40 @@ def _safe_makedirs(path, label):
     try:
         os.makedirs(path, exist_ok=True)
     except Exception as e:
-        print(f"ERRO: Nao foi possivel criar '{label}' em '{path}'.")
-        print(f"Verifique acesso/permissoes e se o drive existe. Detalhe: {e}")
+        emit_terminal("ERROR", f"Nao foi possivel criar a pasta '{label}'.", step="setup", extra={"path": path, "detail": str(e)})
+        emit_terminal("ERROR", "Verifique acesso, permissoes e a disponibilidade do drive.", step="setup")
         sys.exit(2)
 
 _safe_makedirs(PASTA_PROCESSADOS, "processados")
 _safe_makedirs(PASTA_EM_PROCESSAMENTO, "em processamento")
 _safe_makedirs(PASTA_ERROS, "erros")
 _safe_makedirs(PASTA_LOGS, "logs")
+_safe_makedirs(PASTA_JSON, "json")
 PASTA_RELATORIOS = os.path.join(PASTA_BASE, "relatorios")
 _safe_makedirs(PASTA_RELATORIOS, "relatorios")
 
 # Inicializa logger e reporter
-logger = RpaLogger(PASTA_LOGS)
-reporter = ReportGenerator(PASTA_RELATORIOS)
+logger = RpaLogger(
+    PASTA_LOGS,
+    robot_name="ProcessoASO",
+    robot_version=get_project_version(),
+    environment=os.getenv("ROBOT_ENV", "Producao"),
+)
+reporter = ReportGenerator(PASTA_RELATORIOS, json_dir=PASTA_JSON)
 
 TARGET_ACCOUNT = os.getenv("ASO_EMAIL_ACCOUNT", "aso@enesa.com.br")
 GDRIVE_NAME_FILTER = os.getenv("ASO_GDRIVE_NAME_FILTER", "asos enesa").strip().lower()
 GDRIVE_TIMEOUT_SEC = int(os.getenv("ASO_GDRIVE_TIMEOUT_SEC", "60"))
-DEBUG_MODE = os.getenv("ASO_DEBUG", "").strip().lower() in ("1", "true", "yes")
+DEBUG_MODE = (
+    os.getenv("ASO_DEBUG", "").strip().lower() in ("1", "true", "yes")
+    or os.getenv("DEBUG", "").strip().lower() in ("1", "true", "yes")
+)
 REPROCESS_EXISTING = os.getenv("ASO_REPROCESS_EXISTING", "").strip().lower() in ("1", "true", "yes")
+CLEAN_RUN_DIRS = os.getenv("ASO_CLEAN_RUN_DIRS", "1").strip().lower() in ("1", "true", "yes")
+PROCESSED_INDEX_ENABLED = os.getenv("ASO_PROCESSED_INDEX_ENABLE", "1").strip().lower() in ("1", "true", "yes")
+PROCESSED_INDEX_PATH = None
+PROCESSED_INDEX_SUCCESS = set()
+PROCESSED_KEY_BY_FILENAME = {}
 
 
 # ====================================================================
@@ -283,6 +299,110 @@ def salvar_diagnostico_resumo(stats, manifest_path=None, report_paths=None, extr
         pass
 
 
+STANDARD_ERROR_TYPES = {
+    "BUSINESS_VALIDATION",
+    "EXTERNAL_DEPENDENCY",
+    "INTEGRATION",
+    "DATA_QUALITY",
+    "INFRA_IO",
+    "UNEXPECTED",
+}
+
+
+def _normalize_error_type(raw_value, message=""):
+    value = str(raw_value or "").strip().upper()
+    legacy_map = {
+        "TECNICO": "UNEXPECTED",
+        "REGRA DE NEGOCIO": "BUSINESS_VALIDATION",
+        "DADOS INVALIDOS": "DATA_QUALITY",
+        "EXTERNO/INDISPONIBILIDADE": "EXTERNAL_DEPENDENCY",
+    }
+    if value in STANDARD_ERROR_TYPES:
+        return value
+    if value in legacy_map:
+        return legacy_map[value]
+
+    msg = str(message or "").upper()
+    if any(token in msg for token in ("TIMEOUT", "OUTLOOK", "SHAREPOINT", "YUBE", "INDISPON", "CONEX")):
+        return "EXTERNAL_DEPENDENCY"
+    if any(token in msg for token in ("CPF", "NOME", "INVALID", "OCR", "DADO", "LEITURA")):
+        return "DATA_QUALITY"
+    if any(token in msg for token in ("PASTA", "ARQUIVO", "PERMIS", "DRIVE", "DISK", "IO")):
+        return "INFRA_IO"
+    if any(token in msg for token in ("SQL", "BANCO", "ODBC", "INTEGR")):
+        return "INTEGRATION"
+    if any(token in msg for token in ("REGRA", "RASCUNHO", "DUPLIC")):
+        return "BUSINESS_VALIDATION"
+    return "UNEXPECTED"
+
+
+def _limpar_pasta(path, label):
+    try:
+        if not os.path.isdir(path):
+            return
+        removidos_arquivos = 0
+        removidos_dirs = 0
+        for entry in os.scandir(path):
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    shutil.rmtree(entry.path, ignore_errors=True)
+                    removidos_dirs += 1
+                else:
+                    os.remove(entry.path)
+                    removidos_arquivos += 1
+            except Exception:
+                continue
+        registrar_log(
+            f"Limpeza da pasta {label} concluida.",
+            context={"arquivos": removidos_arquivos, "dirs": removidos_dirs},
+        )
+    except Exception as e:
+        registrar_log(f"Falha ao limpar pasta {label}: {e}")
+
+
+def _load_processed_index(path):
+    if not path or not os.path.exists(path):
+        return set()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            keys = data.get("success_keys") or data.get("items") or []
+        elif isinstance(data, list):
+            keys = data
+        else:
+            keys = []
+        return set(k for k in keys if isinstance(k, str) and k)
+    except Exception:
+        return set()
+
+
+def _save_processed_index(path, keys):
+    if not path:
+        return
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        payload = {
+            "version": 1,
+            "updated_at": datetime.now().isoformat(),
+            "success_keys": sorted(list(keys)),
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        registrar_log(f"Falha ao salvar manifest de processados: {e}")
+
+
+def _default_processed_index_path():
+    day_key = datetime.now().strftime("%Y-%m-%d")
+    return os.path.join(PASTA_JSON, f"processed_index_{day_key}.json")
+
+
+def _build_record_key(numero_obra, nome_limpo, cpf, dataaso):
+    raw = f"{numero_obra}|{nome_limpo}|{cpf}|{dataaso or ''}"
+    return hashlib.sha256(raw.encode("utf-8", errors="ignore")).hexdigest()
+
+
 def _calc_resultado_final(total_processado, total_sucesso, total_erro):
     try:
         total_processado = int(total_processado or 0)
@@ -348,12 +468,13 @@ def _map_auditoria_errors(stats_gerais, execution_id):
         mensagem = err.get("erro", "") or ""
         etapa = err.get("etapa") or err.get("arquivo") or ""
         registro_id = err.get("registro_id") or err.get("arquivo") or ""
+        error_type = _normalize_error_type(err.get("tipo_erro"), mensagem)
         errors.append({
             "run_id": execution_id,
             "robo_nome": "ASO",
             "timestamp": err.get("timestamp") or now_iso,
             "etapa": etapa,
-            "tipo_erro": err.get("tipo_erro") or "Tecnico",
+            "tipo_erro": error_type,
             "codigo_erro": err.get("codigo_erro") or "",
             "mensagem_resumida": mensagem[:500],
             "registro_id": registro_id,
@@ -389,6 +510,52 @@ def eh_aso(texto_ocr):
     return False
 
 
+def _extract_dates_from_text(texto):
+    candidatos = []
+    for match in re.finditer(r"([0-3]?\d/[0-1]?\d/\d{4})", texto or ""):
+        bruto = match.group(1)
+        parsed = parse_br_date(bruto)
+        if parsed is None:
+            continue
+        if parsed.year < 2020 or parsed.year > 2100:
+            continue
+        candidatos.append((match.start(), bruto, parsed))
+    return candidatos
+
+
+def _extrair_data_aso_texto(texto, texto_compacto):
+    contextos = [
+        r"DATA\s*(?:DO\s*)?ASO",
+        r"DATA\s*(?:DO\s*)?EXAME",
+        r"DATA\s+EMISS[ÃA]O",
+        r"EMISS[ÃA]O",
+        r"ATESTADO\s+DE\s+SA[ÚU]DE\s+OCUPACIONAL",
+    ]
+    for contexto in contextos:
+        match = re.search(
+            rf"{contexto}[^\d]{{0,20}}([0-3]?\d/[0-1]?\d/\d{{4}})",
+            texto_compacto or "",
+            re.IGNORECASE,
+        )
+        if match:
+            return match.group(1)
+
+    linhas = (texto or "").splitlines()
+    for linha in linhas:
+        if not re.search(r"(ASO|SA[ÚU]DE\s+OCUPACIONAL|EXAME|EMISS[ÃA]O|DATA)", linha, re.IGNORECASE):
+            continue
+        datas_linha = _extract_dates_from_text(linha)
+        if datas_linha:
+            return datas_linha[-1][1]
+
+    todas_datas = _extract_dates_from_text(texto)
+    if not todas_datas:
+        return "Desconhecida"
+
+    # Sem contexto claro, usa a data mais recente encontrada no documento.
+    return max(todas_datas, key=lambda item: item[2])[1]
+
+
 # ====================================================================
 # FUNÇÃO - EXTRAI DADOS COMPLETOS (OCR)
 # ====================================================================
@@ -408,7 +575,7 @@ def extrair_dados_completos(img, texto_ocr=None, _retry=False):
     # Checagem de Rascunho
     if "RASCUNHO" in texto.upper() and texto.upper().count("RASCUNHO") > 3:
          if DEBUG_MODE:
-             print("INFO: Arquivo identificado como RASCUNHO. Ignorando.")
+             emit_terminal("INFO", "Arquivo identificado como rascunho. Ignorando.", step="ocr")
          return "RASCUNHO", "Ignorar", "", "", texto_ocr
 
     # Normalizar um pouco o texto para buscas
@@ -418,9 +585,9 @@ def extrair_dados_completos(img, texto_ocr=None, _retry=False):
     if DEBUG_MODE:
         if len(texto) > 0:
             clean_debug = texto_compacto[:300].encode('ascii', 'ignore').decode('ascii')
-            print(f"DEBUG OCR RAW (start): {clean_debug}...")
+            emit_terminal("DEBUG", "Amostra do OCR capturada.", step="ocr", extra={"sample": clean_debug})
         else:
-            print("DEBUG OCR RAW: Vazio!")
+            emit_terminal("DEBUG", "OCR retornou vazio.", step="ocr")
 
     # ---------------- CPF ----------------
     cpf = "CPF_Desconhecido"
@@ -565,31 +732,17 @@ def extrair_dados_completos(img, texto_ocr=None, _retry=False):
     # --- DIAGNÓSTICO PARA O USUÁRIO ---
     if DEBUG_MODE:
         if cpf == "CPF_Desconhecido":
-            print("ALERTA DE LEITURA: Nao foi possivel ler o CPF neste arquivo.")
+            emit_terminal("WARNING", "Nao foi possivel ler o CPF neste arquivo.", step="ocr")
             registrar_log(f"DEBUG OCR: Falha CPF", context={"partial_text": texto[:100], "status": "CPF_MISSING"})
         elif nome == "Desconhecido":
-            print(f"ALERTA DE LEITURA: CPF encontrado ({mask_cpf(cpf)}), mas NOME nao identificado.")
+            emit_terminal("WARNING", "CPF identificado, mas nome nao foi localizado.", step="ocr", extra={"cpf": mask_cpf(cpf)})
             registrar_log(f"DEBUG OCR: Falha Nome", context={"cpf": cpf, "partial_text": texto[:100], "status": "NAME_MISSING"})
     else:
         # Sucesso parcial (debug)
         pass # print(f"   (Leitura OK: {nome} | {cpf})")
 
     # ---------------- DATA ASO (mais robusta) ----------------
-    data_aso = "Desconhecida"
-
-    # Tenta pegar datas perto de palavras-chave
-    padrao_data_contexto = re.search(
-        r"(DATA\s*(do\s*ASO|exame)?[:\s\-]*)([0-3]?\d/[0-1]?\d/\d{4})",
-        texto_compacto,
-        re.IGNORECASE
-    )
-    if padrao_data_contexto:
-        data_aso = padrao_data_contexto.group(3)
-    else:
-        # fallback: primeira data que aparecer no texto
-        data_match = re.search(r"([0-3]?\d/[0-1]?\d/\d{4})", texto)
-        if data_match:
-            data_aso = data_match.group(1)
+    data_aso = _extrair_data_aso_texto(texto, texto_compacto)
 
     # ---------------- FUNÇÃO / CARGO / GHE (mais precisa) ----------------
     funcao_cargo = "Desconhecida"
@@ -746,13 +899,9 @@ def salvar_paginas_individualmente(pdf_path, pasta_destino, numero_obra, lista_n
             nome_final = f"{nome_limpo} - {cpf}.pdf"
             caminho_final = os.path.join(pasta_destino, nome_final)
 
-            if should_skip_duplicate(caminho_final):
-                if REPROCESS_EXISTING:
-                    registrar_log(f"Arquivo ja existe; reprocessando no RPA: {caminho_final}")
-                    if lista_novos_arquivos is not None and caminho_final not in lista_novos_arquivos:
-                        lista_novos_arquivos.append(caminho_final)
-                    continue
-                registrar_log(f"Arquivo ja existe na pasta (nao sobrescrito): {caminho_final}")
+            record_key = _build_record_key(numero_obra, nome_limpo, cpf, dataaso)
+            if PROCESSED_INDEX_ENABLED and record_key in PROCESSED_INDEX_SUCCESS and not REPROCESS_EXISTING:
+                registrar_log(f"Arquivo ja processado (manifest): {caminho_final}")
                 if stats is not None:
                     stats["skipped_duplicate"] += 1
                     stats["skipped_items"].append(f"{SKIPPED_DUPLICATE}: {mask_cpf_in_text(nome_final)}")
@@ -761,15 +910,48 @@ def salvar_paginas_individualmente(pdf_path, pasta_destino, numero_obra, lista_n
                         "file_display": mask_cpf_in_text(nome_final),
                         "cpf_masked": mask_cpf(cpf),
                         "outcome": SKIPPED_DUPLICATE,
-                        "message": "Arquivo ja existente",
+                        "message": "Arquivo ja processado anteriormente (manifest)",
                     })
+                continue
+
+            if should_skip_duplicate(caminho_final):
+                registrar_log(f"Arquivo ja existe; reutilizando para RPA (nao pula por arquivo): {caminho_final}")
+                insert_aso_record(
+                    {
+                        "origem_robo": "ASOgui",
+                        "nome": nome,
+                        "cpf": cpf,
+                        "data_aso": dataaso,
+                        "funcao_cargo": funcao_cargo,
+                        "arquivo_origem": caminho_final,
+                        "referencia_origem": numero_obra,
+                    },
+                    log_fn=registrar_log,
+                )
+                if lista_novos_arquivos is not None and caminho_final not in lista_novos_arquivos:
+                    lista_novos_arquivos.append(caminho_final)
+                PROCESSED_KEY_BY_FILENAME[os.path.basename(caminho_final)] = record_key
                 continue
 
             img.save(caminho_final, "PDF", resolution=300.0)
             registrar_log(f"Arquivo salvo: {caminho_final}")
 
+            insert_aso_record(
+                {
+                    "origem_robo": "ASOgui",
+                    "nome": nome,
+                    "cpf": cpf,
+                    "data_aso": dataaso,
+                    "funcao_cargo": funcao_cargo,
+                    "arquivo_origem": caminho_final,
+                    "referencia_origem": numero_obra,
+                },
+                log_fn=registrar_log,
+            )
+
             if lista_novos_arquivos is not None:
                 lista_novos_arquivos.append(caminho_final)
+            PROCESSED_KEY_BY_FILENAME[os.path.basename(caminho_final)] = record_key
 
             try:
                 with open(txt_path, "a", encoding="utf-8") as txt:
@@ -799,10 +981,10 @@ def salvar_paginas_individualmente(pdf_path, pasta_destino, numero_obra, lista_n
 def salvar_manifest(manifest, report_dir, filepath=None, execution_id=None):
     os.makedirs(report_dir, exist_ok=True)
     if not filepath:
+        ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         if execution_id:
-            filename = f"manifest_{execution_id}.json"
+            filename = f"manifest_{ts}__{execution_id}.json"
         else:
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"manifest_{ts}.json"
         filepath = os.path.join(report_dir, filename)
     safe_manifest = mask_pii_in_obj(manifest)
@@ -1096,6 +1278,24 @@ def captar_emails(limit=200, execution_id=None, started_at=None, manifest=None):
                     return datetime.fromtimestamp(float(t))
                 except Exception:
                     pass
+                if isinstance(t, str):
+                    raw = t.strip()
+                    for fmt in (
+                        "%d/%m/%Y %H:%M:%S",
+                        "%d/%m/%Y %H:%M",
+                        "%m/%d/%Y %H:%M:%S",
+                        "%m/%d/%Y %H:%M",
+                        "%Y-%m-%d %H:%M:%S",
+                        "%Y-%m-%d %H:%M",
+                    ):
+                        try:
+                            return datetime.strptime(raw, fmt)
+                        except Exception:
+                            pass
+                    try:
+                        return datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone().replace(tzinfo=None)
+                    except Exception:
+                        pass
             except Exception:
                 continue
         return None
@@ -1139,26 +1339,26 @@ def captar_emails(limit=200, execution_id=None, started_at=None, manifest=None):
         except Exception:
             pass
 
-    def _find_best_inbox(ns, inicio_janela, inicio_amanha):
+    def _find_best_inbox(ns, inicio_janela, inicio_amanha, preferred_smtp=None):
         pattern = re.compile(
             r"(?:ENC:|RE:|FWD:|FW:)?\s*ASO\s+ADMISSIONAL",
             re.IGNORECASE,
         )
         best = None
         candidates = []
-        for root in ns.Folders:
+        seen_paths = set()
+
+        def _consider_inbox(inbox, store_name):
+            nonlocal best
+            if not inbox:
+                return
             try:
-                store_name = getattr(root, "Name", "")
-                inbox = None
-                try:
-                    inbox = root.Folders("Caixa de Entrada")
-                except Exception:
-                    try:
-                        inbox = root.Folders("Inbox")
-                    except Exception:
-                        inbox = None
-                if not inbox:
-                    continue
+                folder_path = getattr(inbox, "FolderPath", "") or ""
+                path_key = folder_path.lower()
+                if path_key and path_key in seen_paths:
+                    return
+                if path_key:
+                    seen_paths.add(path_key)
                 items = inbox.Items
                 try:
                     items.Sort("[ReceivedTime]", True)
@@ -1180,7 +1380,7 @@ def captar_emails(limit=200, execution_id=None, started_at=None, manifest=None):
                         continue
                 candidates.append({
                     "store": store_name,
-                    "folder": getattr(inbox, "FolderPath", ""),
+                    "folder": folder_path,
                     "latest": latest_dt.isoformat() if latest_dt else None,
                     "has_match_today": has_match_today,
                 })
@@ -1188,10 +1388,44 @@ def captar_emails(limit=200, execution_id=None, started_at=None, manifest=None):
                 if best is None or score > best["score"]:
                     best = {"inbox": inbox, "score": score}
             except Exception:
+                return
+
+        for root in ns.Folders:
+            try:
+                store_name = getattr(root, "Name", "")
+                inbox = None
+                try:
+                    inbox = root.Folders("Caixa de Entrada")
+                except Exception:
+                    try:
+                        inbox = root.Folders("Inbox")
+                    except Exception:
+                        inbox = None
+                _consider_inbox(inbox, store_name)
+            except Exception:
                 continue
+
+        if preferred_smtp:
+            _consider_inbox(_get_shared_inbox(ns, preferred_smtp), f"shared:{preferred_smtp}")
+
         if candidates and DEBUG_MODE:
             registrar_log("Candidatos Inbox (auto):", context={"candidates": candidates})
         return best["inbox"] if best else None
+
+    def _summarize_inbox(items, inicio_janela, inicio_amanha, sample_size=50):
+        latest_dt = None
+        in_window = 0
+        for i in range(1, min(sample_size, items.Count) + 1):
+            try:
+                msg = items.Item(i)
+                drec = _get_msg_datetime(msg)
+                if drec and (latest_dt is None or drec > latest_dt):
+                    latest_dt = drec
+                if drec and inicio_janela <= drec < inicio_amanha:
+                    in_window += 1
+            except Exception:
+                continue
+        return latest_dt, in_window
 
     def _capta_core():
         registrar_log("Iniciando leitura do Outlook...")
@@ -1298,6 +1532,31 @@ def captar_emails(limit=200, execution_id=None, started_at=None, manifest=None):
             registrar_log(f"Janela de busca: últimos {days_back} dias (de {inicio_janela.date()} até {inicio_amanha.date()})")
             if days_back_env:
                 registrar_log(f"  (Configurado via ASO_DAYS_BACK={days_back_env})")
+
+        try:
+            latest_dt, in_window = _summarize_inbox(mensagens, inicio_janela, inicio_amanha)
+            if in_window == 0:
+                fallback_inbox = _find_best_inbox(outlook, inicio_janela, inicio_amanha, EMAIL_DESEJADO)
+                if fallback_inbox is not None:
+                    fallback_path = getattr(fallback_inbox, "FolderPath", "")
+                    current_path = getattr(inbox, "FolderPath", "")
+                    if fallback_path and fallback_path != current_path:
+                        registrar_log(
+                            "Inbox selecionada sem mensagens na janela; alternando automaticamente.",
+                            context={
+                                "from": current_path,
+                                "to": fallback_path,
+                                "latest_selected": latest_dt.isoformat() if latest_dt else None,
+                            },
+                        )
+                        inbox = fallback_inbox
+                        mensagens = inbox.Items
+                        try:
+                            mensagens.Sort("[ReceivedTime]", True)
+                        except Exception:
+                            mensagens.Sort("ReceivedTime", True)
+        except Exception:
+            pass
         
         # ESTATISTICAS GERAIS ACUMULADAS
         stats_gerais = {
@@ -1310,6 +1569,7 @@ def captar_emails(limit=200, execution_id=None, started_at=None, manifest=None):
             'skipped_duplicate': 0,
             'skipped_draft': 0,
             'skipped_non_aso': 0,
+            'skipped_yube': 0,
             'ocr_failures': [],
             'sucessos': [],
             'erros': [],
@@ -1373,10 +1633,15 @@ def captar_emails(limit=200, execution_id=None, started_at=None, manifest=None):
             try:
                 msg = mensagens.Item(i)
         
-                # Apenas emails
-                if getattr(msg, "Class", None) != 43:
-                    continue
-        
+                # Em alguns ambientes Outlook/COM (ou wrappers), o item pode nao expor Class=43
+                # mesmo sendo um email utilizavel. So pulamos se nem ao menos houver assunto.
+                msg_class = getattr(msg, "Class", None)
+                if msg_class not in (None, 43):
+                    try:
+                        _ = msg.Subject
+                    except Exception:
+                        continue
+
                 recebido = _get_msg_datetime(msg)
                 if not recebido:
                     continue
@@ -1422,13 +1687,25 @@ def captar_emails(limit=200, execution_id=None, started_at=None, manifest=None):
 
                 registrar_log(f"Pasta destino: {pasta_data}")
         
+                body_text = ""
+                try:
+                    body_text = (msg.HTMLBody or "")
+                except Exception:
+                    body_text = ""
+                try:
+                    body_text = body_text + "\n" + (msg.Body or "")
+                except Exception:
+                    pass
+
+                gdrive_ids = _extract_gdrive_file_ids(body_text)
+
                 anexos_pdf = []
                 total_attachments = msg.Attachments.Count
                 for ai in range(1, total_attachments + 1):
                     att = msg.Attachments.Item(ai)
                     if att.FileName.lower().endswith(".pdf"):
                         anexos_pdf.append(att)
-        
+
                 if anexos_pdf:
                     for idx, anexo in enumerate(anexos_pdf, start=1):
                         try:
@@ -1451,24 +1728,17 @@ def captar_emails(limit=200, execution_id=None, started_at=None, manifest=None):
                             last_error = f"Erro ao processar anexo {idx}: {e}"
                             registrar_log(last_error)
                             stats_gerais['erros'].append({'arquivo': f"AnexoEmail_{idx}", 'erro': f"Erro extracao PDF: {e}"})
-                else:
-                    body_text = ""
-                    try:
-                        body_text = (msg.HTMLBody or "")
-                    except Exception:
-                        body_text = ""
-                    try:
-                        body_text = body_text + "\n" + (msg.Body or "")
-                    except Exception:
-                        pass
-                    
-                    gdrive_ids = _extract_gdrive_file_ids(body_text)
-                    if not gdrive_ids:
-                        registrar_log("  Aviso: Nenhum anexo PDF ou link Google Drive encontrado neste email")
-                        continue
-                    
-                    registrar_log(f"  Nenhum anexo PDF. Links Google Drive encontrados: {len(gdrive_ids)}")
-                    
+
+                if not anexos_pdf and not gdrive_ids:
+                    registrar_log("  Aviso: Nenhum anexo PDF ou link Google Drive encontrado neste email")
+                    continue
+
+                if gdrive_ids:
+                    if anexos_pdf:
+                        registrar_log(f"  Links Google Drive adicionais encontrados: {len(gdrive_ids)}")
+                    else:
+                        registrar_log(f"  Nenhum anexo PDF. Links Google Drive encontrados: {len(gdrive_ids)}")
+
                     baixados = []
                     for gid in gdrive_ids:
                         try:
@@ -1528,6 +1798,11 @@ def captar_emails(limit=200, execution_id=None, started_at=None, manifest=None):
                             stats_gerais['erros'].extend([{"arquivo": mask_cpf_in_text(e.get('arquivo', 'Desconhecido')), "erro": e.get('erro', '')} for e in stats_rpa.get('erros', [])])
                             stats_gerais['success'] += len(stats_rpa.get('sucessos', []))
                             stats_gerais['error'] += len(stats_rpa.get('erros', []))
+                            stats_gerais['skipped_yube'] += len(stats_rpa.get('pulados', []))
+                            for skipped in stats_rpa.get('pulados', []):
+                                stats_gerais['skipped_items'].append(
+                                    f"SKIPPED_YUBE: {mask_cpf_in_text(skipped.get('arquivo', 'Desconhecido'))} ({skipped.get('motivo', '')})"
+                                )
                             stats_gerais['total_processed'] = stats_gerais['success'] + stats_gerais['error']
                             if manifest and manifest.get('items') is not None:
                                 for fname in stats_rpa.get('sucessos', []):
@@ -1544,6 +1819,22 @@ def captar_emails(limit=200, execution_id=None, started_at=None, manifest=None):
                                         'outcome': ERROR,
                                         'message': err.get('erro', '')
                                     })
+                                for skipped in stats_rpa.get('pulados', []):
+                                    manifest['items'].append({
+                                        'file_display': mask_cpf_in_text(skipped.get('arquivo', 'Desconhecido')),
+                                        'cpf_masked': mask_cpf(skipped.get('arquivo', '')),
+                                        'outcome': 'SKIPPED_YUBE',
+                                        'message': skipped.get('motivo', '')
+                                    })
+                            if PROCESSED_INDEX_ENABLED:
+                                for fname in stats_rpa.get('sucessos', []):
+                                    key = PROCESSED_KEY_BY_FILENAME.get(os.path.basename(fname))
+                                    if key:
+                                        PROCESSED_INDEX_SUCCESS.add(key)
+                                for skipped in stats_rpa.get('pulados', []):
+                                    key = PROCESSED_KEY_BY_FILENAME.get(os.path.basename(skipped.get('arquivo', '')))
+                                    if key:
+                                        PROCESSED_INDEX_SUCCESS.add(key)
         
                     except Exception as e:
                         last_error = f"Erro ao executar RPA Yube: {e}"
@@ -1596,7 +1887,7 @@ def captar_emails(limit=200, execution_id=None, started_at=None, manifest=None):
 
         manifest_path = None
         if manifest is not None:
-            manifest_path = salvar_manifest(manifest, PASTA_RELATORIOS, execution_id=execution_id)
+            manifest_path = salvar_manifest(manifest, PASTA_JSON, execution_id=execution_id)
             if manifest_path:
                 manifest['paths']['manifest'] = manifest_path
         
@@ -1627,7 +1918,7 @@ def captar_emails(limit=200, execution_id=None, started_at=None, manifest=None):
                 manifest['email_status'] = email_status
                 manifest['email_error'] = email_error
                 if manifest_path:
-                    salvar_manifest(manifest, PASTA_RELATORIOS, filepath=manifest_path, execution_id=execution_id)
+                    salvar_manifest(manifest, PASTA_JSON, filepath=manifest_path, execution_id=execution_id)
         else:
             registrar_log("Nada processado, email de resumo nao enviado.")
         
@@ -1645,6 +1936,25 @@ def captar_emails(limit=200, execution_id=None, started_at=None, manifest=None):
         registrar_log(f"Mensagens verificadas hoje: {encontrados_hoje}; mensagens processadas: {processados}")
         if DEBUG_MODE and processados == 0 and encontrados_hoje > 0 and sample_subjects:
             registrar_log(f"Amostra de assuntos (hoje, nao processados): {sample_subjects}")
+        if processados == 0 and encontrados_hoje == 0:
+            try:
+                diag_samples = []
+                for di in range(1, min(5, mensagens.Count) + 1):
+                    try:
+                        dmsg = mensagens.Item(di)
+                        parsed = _get_msg_datetime(dmsg)
+                        diag_samples.append({
+                            "received_raw": str(getattr(dmsg, "ReceivedTime", None)),
+                            "parsed": parsed.isoformat() if parsed else None,
+                            "class": str(getattr(dmsg, "Class", None)),
+                            "subject": (getattr(dmsg, "Subject", "") or "")[:120],
+                        })
+                    except Exception:
+                        continue
+                if diag_samples:
+                    registrar_log("Diagnostico inbox (top 5):", context={"samples": diag_samples})
+            except Exception:
+                pass
         return stats_gerais
         
         
@@ -1659,7 +1969,20 @@ def captar_emails(limit=200, execution_id=None, started_at=None, manifest=None):
 if __name__ == "__main__":
     execution_id = str(uuid.uuid4())
     started_at = datetime.now()
-    logger.set_execution_id(execution_id)
+    logger.start_run(started_at=started_at, execution_id=execution_id)
+    logger.stage(1, 3, "Preparacao inicial")
+    if CLEAN_RUN_DIRS:
+        _limpar_pasta(PASTA_EM_PROCESSAMENTO, "em processamento")
+        _limpar_pasta(PASTA_ERROS, "erros")
+        _limpar_pasta(PASTA_PROCESSADOS, "processados")
+    if PROCESSED_INDEX_ENABLED:
+        PROCESSED_INDEX_PATH = os.getenv("ASO_PROCESSED_INDEX_PATH") or _default_processed_index_path()
+        PROCESSED_INDEX_SUCCESS = _load_processed_index(PROCESSED_INDEX_PATH)
+        registrar_log(
+            "Manifest de processados carregado.",
+            context={"count": len(PROCESSED_INDEX_SUCCESS), "path": PROCESSED_INDEX_PATH},
+        )
+    logger.stage(2, 3, "Processamento principal")
     stats_gerais = None
     fatal_error = None
     manifest = {
@@ -1679,6 +2002,7 @@ if __name__ == "__main__":
         stats_gerais = captar_emails(limit=500, execution_id=execution_id, started_at=started_at, manifest=manifest)
     except Exception as e:
         fatal_error = str(e)
+        logger.set_run_status("FALHA CRITICA")
         registrar_log(f"Erro fatal: {e}")
         try:
             with open(os.path.join(PASTA_ERROS, "erro_fatal.txt"), "w", encoding="utf-8") as f:
@@ -1692,4 +2016,30 @@ if __name__ == "__main__":
         log_run(run_data, errors=error_rows)
     except Exception as e:
         registrar_log(f"Falha ao atualizar auditoria Excel: {e}")
+    try:
+        if PROCESSED_INDEX_ENABLED and PROCESSED_INDEX_PATH:
+            _save_processed_index(PROCESSED_INDEX_PATH, PROCESSED_INDEX_SUCCESS)
+    except Exception:
+        pass
+    logger.stage(3, 3, "Encerramento")
     registrar_log("===== FIM DO PROCESSAMENTO =====", context={"execution_id": execution_id})
+    final_status = "FALHA CRITICA" if fatal_error else "CONCLUIDO COM ALERTAS" if (stats_gerais and stats_gerais.get("error")) else "CONCLUIDO"
+    logger.set_run_status(final_status)
+    totals = {
+        "received": int(manifest.get("totals", {}).get("total_detected", 0) or 0),
+        "processed": int(manifest.get("totals", {}).get("total_processed", 0) or 0),
+        "success": int(manifest.get("totals", {}).get("success", 0) or 0),
+        "error": int(manifest.get("totals", {}).get("error", 0) or 0),
+    }
+    report_path = (
+        manifest.get("paths", {}).get("report_md")
+        or manifest.get("paths", {}).get("report_json")
+        or manifest.get("paths", {}).get("manifest")
+    )
+    logger.finish_run(
+        final_status,
+        started_at=started_at,
+        finished_at=finished_at,
+        totals=totals,
+        report_path=report_path,
+    )

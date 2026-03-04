@@ -1,6 +1,7 @@
 import win32com.client as win32
 from datetime import datetime
 import os
+from custom_logger import emit_terminal
 from outcomes import SKIPPED_NO_RECIPIENT
 from utils_masking import mask_cpf_in_text
 
@@ -29,7 +30,7 @@ def enviar_resumo_email(destinatario, relatorio, execution_id, run_status, repor
         if logger:
             logger.warning(msg, step="email")
         else:
-            print(f"[WARN] {msg}")
+            emit_terminal("WARNING", msg, step="email")
         return (SKIPPED_NO_RECIPIENT, msg)
 
     try:
@@ -109,11 +110,11 @@ def enviar_resumo_email(destinatario, relatorio, execution_id, run_status, repor
         if logger:
             logger.info(f"Email enviado para {destinatario}", step="email")
         else:
-            print(f"Email enviado para {destinatario}")
+            emit_terminal("INFO", f"Email enviado para {destinatario}", step="email")
         return ("SENT", None)
     except Exception as e:
         if logger:
             logger.error(f"Erro ao enviar email: {e}", step="email")
         else:
-            print(f"[ERROR] Erro ao enviar email: {e}")
+            emit_terminal("ERROR", f"Erro ao enviar email: {e}", step="email")
         return ("FAILED", str(e))

@@ -10,7 +10,7 @@ from outcomes import (
     SKIPPED_DUPLICATE,
 )
 from utils_masking import mask_cpf, mask_pii_in_obj
-from custom_logger import RpaLogger
+from custom_logger import RpaLogger, emit_terminal
 from reporting import ReportGenerator
 from idempotency import should_skip_duplicate
 
@@ -39,11 +39,13 @@ def main():
     with tempfile.TemporaryDirectory() as tmpdir:
         logs_dir = os.path.join(tmpdir, "logs")
         reports_dir = os.path.join(tmpdir, "relatorios")
+        json_dir = os.path.join(tmpdir, "json")
         os.makedirs(logs_dir, exist_ok=True)
         os.makedirs(reports_dir, exist_ok=True)
+        os.makedirs(json_dir, exist_ok=True)
 
         logger = RpaLogger(logs_dir, execution_id=execution_id)
-        reporter = ReportGenerator(reports_dir)
+        reporter = ReportGenerator(reports_dir, json_dir=json_dir)
 
         rpa_files = []
         duplicate_file = os.path.join(tmpdir, f"JOAO - {cpf_raw}.pdf")
@@ -123,7 +125,7 @@ def main():
         }
 
         manifest = mask_pii_in_obj(manifest)
-        manifest_path = os.path.join(reports_dir, f"manifest_{execution_id}.json")
+        manifest_path = os.path.join(json_dir, f"manifest_2026-03-03_00-00-00__{execution_id}.json")
         with open(manifest_path, "w", encoding="utf-8") as f:
             json.dump(manifest, f, indent=4, ensure_ascii=False)
 
@@ -167,7 +169,7 @@ def main():
         assert os.path.exists(report_paths.get("md")), "Report MD missing"
         assert os.path.exists(manifest_path), "Manifest missing"
 
-    print("SMOKE OK")
+    emit_terminal("OK", "SMOKE OK", step="smoke")
 
 
 if __name__ == "__main__":

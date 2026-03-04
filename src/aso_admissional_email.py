@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 
 import win32com.client as win32
 from dotenv import load_dotenv
+from custom_logger import emit_terminal
 
 load_dotenv()
 
@@ -44,7 +45,7 @@ def registrar_log(msg: str) -> None:
             log_file.write(f"[{datetime.now()}] {msg}\n")
     except Exception:
         pass
-    print(msg)
+    emit_terminal("INFO", msg, step="admissional")
 
 
 def enviar_resumo_email(destinatario, relatorio):
@@ -128,7 +129,7 @@ def enviar_resumo_email(destinatario, relatorio):
         
         mail.HTMLBody = html_body
         mail.Send()
-        print(f"📧 Email de resumo enviado para: {destinatario}")
+        emit_terminal("INFO", f"Email de resumo enviado para: {destinatario}", step="admissional")
         registrar_log(f"Email de resumo enviado para: {destinatario}")
 
     except Exception as e:

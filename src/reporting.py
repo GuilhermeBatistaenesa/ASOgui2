@@ -1,39 +1,44 @@
 import json
 import os
 from datetime import datetime
+
+from custom_logger import emit_terminal
 from utils_masking import mask_pii_in_obj, mask_cpf_in_text
 
 
 class ReportGenerator:
-    def __init__(self, report_dir):
+    def __init__(self, report_dir, json_dir=None):
         self.report_dir = report_dir
+        self.json_dir = json_dir or report_dir
         os.makedirs(report_dir, exist_ok=True)
+        os.makedirs(self.json_dir, exist_ok=True)
 
     def save_report(self, stats):
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"relatorio_{timestamp}.json"
-        filepath = os.path.join(self.report_dir, filename)
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        execution_id = stats.get("execution_id") or "sem-execucao"
+        filename = f"relatorio_execucao_{timestamp}__{execution_id}.json"
+        filepath = os.path.join(self.json_dir, filename)
 
         safe_stats = mask_pii_in_obj(stats)
 
         try:
             with open(filepath, "w", encoding="utf-8") as f:
                 json.dump(safe_stats, f, indent=4, ensure_ascii=False)
-            print(f"ðŸ“„ RelatÃ³rio JSON salvo em: {filepath}")
+            emit_terminal("OK", f"Relatorio JSON salvo em: {filepath}", step="relatorio")
 
-            md_path = self.generate_markdown_summary(safe_stats, timestamp)
+            md_path = self.generate_markdown_summary(safe_stats, timestamp, execution_id)
 
             return {"json": filepath, "md": md_path}
         except Exception as e:
-            print(f"Erro ao salvar relatÃ³rio: {e}")
+            emit_terminal("ERROR", f"Falha ao salvar relatorio: {e}", step="relatorio")
             return {"json": None, "md": None}
 
-    def generate_markdown_summary(self, stats, timestamp):
-        filename = f"resumo_execucao_{timestamp}.md"
+    def generate_markdown_summary(self, stats, timestamp, execution_id):
+        filename = f"resumo_execucao_{timestamp}__{execution_id}.md"
         filepath = os.path.join(self.report_dir, filename)
 
-        execution_id = stats.get("execution_id", "")
-        md_content = f"""# Resumo de ExecuÃ§Ã£o - RPA ASO
+        execution_id = stats.get("execution_id", execution_id)
+        md_content = f"""# Resumo de Execucao - RPA ASO
 **Execution ID**: {execution_id}
 **Data**: {datetime.now().strftime("%d/%m/%Y %H:%M:%S")}
 **Tempo Total**: {stats.get('tempo_total', 'N/A')}
@@ -49,10 +54,10 @@ class ReportGenerator:
 
 ## Detalhes de Erros
 """
-        if stats.get('erros'):
-            for erro in stats['erros']:
-                arquivo = mask_cpf_in_text(erro.get('arquivo', 'Desconhecido'))
-                msg = mask_cpf_in_text(erro.get('erro', 'Sem mensagem'))
+        if stats.get("erros"):
+            for erro in stats["erros"]:
+                arquivo = mask_cpf_in_text(erro.get("arquivo", "Desconhecido"))
+                msg = mask_cpf_in_text(erro.get("erro", "Sem mensagem"))
                 md_content += f"- **{arquivo}**: {msg}\n"
         else:
             md_content += "Nenhum erro registrado.\n"
@@ -80,8 +85,8 @@ class ReportGenerator:
         try:
             with open(filepath, "w", encoding="utf-8") as f:
                 f.write(md_content)
-            print(f"ðŸ“„ Resumo Markdown salvo em: {filepath}")
+            emit_terminal("OK", f"Resumo markdown salvo em: {filepath}", step="relatorio")
             return filepath
         except Exception as e:
-            print(f"Erro ao salvar resumo markdown: {e}")
+            emit_terminal("ERROR", f"Falha ao salvar resumo markdown: {e}", step="relatorio")
             return None

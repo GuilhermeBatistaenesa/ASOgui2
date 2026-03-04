@@ -545,22 +545,26 @@ def _add_volume_bar_chart(ws, anchor: str) -> None:
 
 
 def _add_error_pie_chart(ws, anchor: str) -> None:
-    ws["L3"] = "Tecnico"
-    ws["L4"] = "Regra de Negocio"
-    ws["L5"] = "Dados Invalidos"
-    ws["L6"] = "Externo/Indisponibilidade"
+    ws["L3"] = "BUSINESS_VALIDATION"
+    ws["L4"] = "EXTERNAL_DEPENDENCY"
+    ws["L5"] = "INTEGRATION"
+    ws["L6"] = "DATA_QUALITY"
+    ws["L7"] = "INFRA_IO"
+    ws["L8"] = "UNEXPECTED"
     ws["M2"] = "Qtd"
-    ws["M3"] = '=COUNTIF(tbl_errors[tipo_erro],"Tecnico")'
-    ws["M4"] = '=COUNTIF(tbl_errors[tipo_erro],"Regra de Negocio")'
-    ws["M5"] = '=COUNTIF(tbl_errors[tipo_erro],"Dados Invalidos")'
-    ws["M6"] = '=COUNTIF(tbl_errors[tipo_erro],"Externo/Indisponibilidade")'
+    ws["M3"] = '=COUNTIF(tbl_errors[tipo_erro],"BUSINESS_VALIDATION")'
+    ws["M4"] = '=COUNTIF(tbl_errors[tipo_erro],"EXTERNAL_DEPENDENCY")'
+    ws["M5"] = '=COUNTIF(tbl_errors[tipo_erro],"INTEGRATION")'
+    ws["M6"] = '=COUNTIF(tbl_errors[tipo_erro],"DATA_QUALITY")'
+    ws["M7"] = '=COUNTIF(tbl_errors[tipo_erro],"INFRA_IO")'
+    ws["M8"] = '=COUNTIF(tbl_errors[tipo_erro],"UNEXPECTED")'
 
     chart = PieChart()
     chart.height = 8
     chart.width = 10
     chart.title = "Distribuicao de Erros"
-    data = Reference(ws, min_col=13, min_row=2, max_row=6)
-    cats = Reference(ws, min_col=12, min_row=3, max_row=6)
+    data = Reference(ws, min_col=13, min_row=2, max_row=8)
+    cats = Reference(ws, min_col=12, min_row=3, max_row=8)
     chart.add_data(data, titles_from_data=True)
     chart.set_categories(cats)
     ws.add_chart(chart, anchor)
