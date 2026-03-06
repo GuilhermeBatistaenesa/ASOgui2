@@ -145,6 +145,7 @@ PASTA_EM_PROCESSAMENTO = os.path.join(PASTA_BASE, "em processamento")
 PASTA_ERROS = os.path.join(PASTA_BASE, "erros")
 PASTA_LOGS = os.path.join(PASTA_BASE, "logs")
 PASTA_JSON = os.path.join(PASTA_BASE, "json")
+PASTA_ADMISSAO_INPUT = os.getenv("ASO_ADMITIR_INPUT_DIR", r"P:\ProcessoAsoAdimitir\processados")
 EMAIL_DESEJADO = os.getenv("ASO_EMAIL_ACCOUNT", "aso@enesa.com.br")
 MAILBOX_NAME = os.getenv("ASO_MAILBOX_NAME", "Aso")  # nome exibido na árvore
 
@@ -161,6 +162,7 @@ _safe_makedirs(PASTA_EM_PROCESSAMENTO, "em processamento")
 _safe_makedirs(PASTA_ERROS, "erros")
 _safe_makedirs(PASTA_LOGS, "logs")
 _safe_makedirs(PASTA_JSON, "json")
+_safe_makedirs(PASTA_ADMISSAO_INPUT, "admissao_input")
 PASTA_RELATORIOS = os.path.join(PASTA_BASE, "relatorios")
 _safe_makedirs(PASTA_RELATORIOS, "relatorios")
 
@@ -186,6 +188,19 @@ PROCESSED_INDEX_ENABLED = os.getenv("ASO_PROCESSED_INDEX_ENABLE", "1").strip().l
 PROCESSED_INDEX_PATH = None
 PROCESSED_INDEX_SUCCESS = set()
 PROCESSED_KEY_BY_FILENAME = {}
+
+
+def _espelhar_para_admissao(caminho_origem):
+    try:
+        if not caminho_origem or not os.path.isfile(caminho_origem):
+            return None
+        destino = os.path.join(PASTA_ADMISSAO_INPUT, os.path.basename(caminho_origem))
+        shutil.copy2(caminho_origem, destino)
+        registrar_log("Arquivo espelhado para fila de admissao.", context={"source_file": destino})
+        return destino
+    except Exception as e:
+        registrar_log(f"Falha ao espelhar arquivo para admissao: {e}", context={"source_file": caminho_origem})
+        return None
 
 
 # ====================================================================
@@ -930,11 +945,13 @@ def salvar_paginas_individualmente(pdf_path, pasta_destino, numero_obra, lista_n
                 )
                 if lista_novos_arquivos is not None and caminho_final not in lista_novos_arquivos:
                     lista_novos_arquivos.append(caminho_final)
+                _espelhar_para_admissao(caminho_final)
                 PROCESSED_KEY_BY_FILENAME[os.path.basename(caminho_final)] = record_key
                 continue
 
             img.save(caminho_final, "PDF", resolution=300.0)
             registrar_log(f"Arquivo salvo: {caminho_final}")
+            _espelhar_para_admissao(caminho_final)
 
             insert_aso_record(
                 {
